@@ -41,6 +41,7 @@
 
   envy.darwin.software.homebrew.casks.exclude = [
     "microsoft-remote-desktop"
+    "neteasemusic"
   ];
   # END ENVY MANAGED SOFTWARE
 
