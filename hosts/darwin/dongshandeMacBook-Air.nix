@@ -53,6 +53,8 @@
   envy.llm.credentials.deepseek.secretPath = "llm/deepseek/apikey";
   envy.llm.credentials.stepfun.kind = "api-key";
   envy.llm.credentials.stepfun.secretPath = "llm/steps/apikey";
+  envy.llm.credentials.tc.kind = "api-key";
+  envy.llm.credentials.tc.secretPath = "llm/tc/apikey";
 
   # --- LLM ENDPOINTS ---
   envy.llm.endpoints.deepseek-openai.baseUrl = "https://api.deepseek.com";
@@ -61,17 +63,29 @@
   envy.llm.endpoints.stepfun-anthropic.protocol = "anthropic-compatible";
   envy.llm.endpoints.stepfun-openai.baseUrl = "https://stepfun.com/v1";
   envy.llm.endpoints.stepfun-openai.protocol = "openai-compatible";
+  envy.llm.endpoints.sub2api-anthropic.baseUrl = "https://49.233.149.230:3389";
+  envy.llm.endpoints.sub2api-anthropic.protocol = "anthropic-compatible";
+  envy.llm.endpoints.xikai-openai.baseUrl = "https://api.xikai.site/v1";
+  envy.llm.endpoints.xikai-openai.protocol = "openai-compatible";
 
   # --- AGENTS ---
   envy.agents.cc.adapter = "claude-code";
   envy.agents.cc.aliases = [ "ccli" ];
-  envy.agents.cc.credential = "stepfun";
-  envy.agents.cc.endpoint = "stepfun-anthropic";
-  envy.agents.cc.model = "step-3.7-flash";
+  envy.agents.cc.credential = "tc";
+  envy.agents.cc.endpoint = "sub2api-anthropic";
+  envy.agents.cc.model = "claude-fable-5-1";
   envy.agents.codex.adapter = "codex";
-  envy.agents.codex.credential = "stepfun";
-  envy.agents.codex.endpoint = "stepfun-openai";
-  envy.agents.codex.model = "step-3.7-flash";
+  envy.agents.codex.credential = "tc";
+  envy.agents.codex.endpoint = "xikai-openai";
+  envy.agents.codex.model = "gpt-6.1-sol";
+  envy.agents.pi.adapter = "pi";
+  envy.agents.pi.additionalSettings = builtins.fromJSON "{\"compaction\": {\"keepRecentTokens\": 27200, \"reserveTokens\": 27200}, \"defaultTools\": [\"+codemode\"]}";
+  envy.agents.pi.contextWindow = 272000;
+  envy.agents.pi.credential = "tc";
+  envy.agents.pi.endpoint = "xikai-openai";
+  envy.agents.pi.maxTokens = 128000;
+  envy.agents.pi.model = "gpt-6.1-sol";
+  envy.agents.pi.moreThinking = true;
   # END ENVY MANAGED AGENTS
 
 }
