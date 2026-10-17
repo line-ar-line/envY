@@ -39,9 +39,17 @@
   # BEGIN ENVY MANAGED SOFTWARE
   # `envy setup` and `envy software` own only these machine-local selections.
 
+  envy.darwin.software.homebrew.casks.include = [
+    "steam"
+  ];
+
   envy.darwin.software.homebrew.casks.exclude = [
     "microsoft-remote-desktop"
     "neteasemusic"
+  ];
+
+  envy.darwin.software.homebrew.repositories.include = [
+    "homebrew/cask"
   ];
   # END ENVY MANAGED SOFTWARE
 
