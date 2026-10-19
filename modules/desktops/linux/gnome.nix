@@ -1,7 +1,12 @@
 { pkgs, config, lib, ... }:
 
 let
-  wallpaperPath = ../../../resources/images/background.jpg;
+  wallpaperCandidates = [
+    ../../../resources/images/background.jpg
+    ../../../resources/images/background.jpeg
+    ../../../resources/images/background.png
+  ];
+  wallpaperPath = lib.findFirst builtins.pathExists (throw "No wallpaper found in resources/images") wallpaperCandidates;
   desktop = config.envy.linux.desktop;
   enabled = config.envy.linux.option == "desktop"
     && (desktop == "gnome" || desktop == "all");

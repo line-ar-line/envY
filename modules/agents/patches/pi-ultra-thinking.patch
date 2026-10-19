@@ -284,14 +284,9 @@
  ];
 --- a/packages/coding-agent/src/core/model-config.ts
 +++ b/packages/coding-agent/src/core/model-config.ts
-@@ -25,6 +25,7 @@
- 	high: Type.Optional(SamplingParamsSchema),
- 	xhigh: Type.Optional(SamplingParamsSchema),
- 	max: Type.Optional(SamplingParamsSchema),
-+	ultra: Type.Optional(SamplingParamsSchema),
- });
- 
- const PositiveTokenCountSchema = Type.Number({ exclusiveMinimum: 0 });
+@@ -28,1 +28,2 @@
+		max: Type.Optional(SamplingParamsSchema),
++		ultra: Type.Optional(SamplingParamsSchema),
 --- a/packages/coding-agent/src/core/provider-composer.ts
 +++ b/packages/coding-agent/src/core/provider-composer.ts
 @@ -167,7 +167,7 @@
@@ -314,16 +309,6 @@
  
  /**
   * Why a request is being routed.
---- a/packages/coding-agent/src/experimental/services/slash-commands-provider.ts
-+++ b/packages/coding-agent/src/experimental/services/slash-commands-provider.ts
-@@ -14,6 +14,7 @@
- 	high: "Deep reasoning",
- 	xhigh: "Extra-high reasoning",
- 	max: "Maximum reasoning",
-+	ultra: "Ultra reasoning",
- };
- 
- interface RegisteredSlashCommand {
 --- a/packages/coding-agent/src/modes/interactive/components/settings-selector.ts
 +++ b/packages/coding-agent/src/modes/interactive/components/settings-selector.ts
 @@ -45,6 +45,7 @@

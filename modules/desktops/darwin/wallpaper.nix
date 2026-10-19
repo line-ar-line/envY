@@ -1,12 +1,18 @@
 { config, pkgs, lib, sys, ... }:
 
 let
-  wallpaperSource = ../../../resources/images/background.jpg;
+  wallpaperCandidates = [
+    ../../../resources/images/background.jpg
+    ../../../resources/images/background.jpeg
+    ../../../resources/images/background.png
+  ];
+  wallpaperSource = lib.findFirst builtins.pathExists (throw "No wallpaper found in resources/images") wallpaperCandidates;
+  wallpaperFilename = builtins.baseNameOf (toString wallpaperSource);
   # macOS keeps the wallpaper URL in WallpaperAgent's store.  Keep that URL
   # outside the Nix store so a Home Manager generation switch cannot make it
   # temporarily disappear or leave WallpaperAgent with a stale symlink.
   wallpaperDir = "${config.home.homeDirectory}/Library/Application Support/envy/wallpapers";
-  wallpaperPath = "${wallpaperDir}/background.jpg";
+  wallpaperPath = "${wallpaperDir}/${wallpaperFilename}";
 in
 
 {
@@ -14,7 +20,7 @@ in
     [ pkgs.desktoppr ];
   envy.software.nix.packages.references.desktoppr = "nix:desktoppr";
 
-  home.file.".config/wallpapers/background.jpg" =
+  home.file.".config/wallpapers/${wallpaperFilename}" =
     lib.mkIf (builtins.elem "desktoppr" (map lib.getName config.envy.software.nix.packages.effective)) {
       # Keep the legacy convenience path, but make it point at the persistent
       # copy rather than at a generation-specific Nix store path.

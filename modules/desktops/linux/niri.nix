@@ -5,7 +5,12 @@ let
   selected = config.envy.linux.option == "desktop"
     && (config.envy.linux.desktop == "niri" || config.envy.linux.desktop == "all");
   enabled = selected && !(builtins.elem "niri" config.envy.software.nix.packages.exclude);
-  wallpaperPath = ../../../resources/images/background.jpg;
+  wallpaperCandidates = [
+    ../../../resources/images/background.jpg
+    ../../../resources/images/background.jpeg
+    ../../../resources/images/background.png
+  ];
+  wallpaperPath = lib.findFirst builtins.pathExists (throw "No wallpaper found in resources/images") wallpaperCandidates;
   screenshotHelper = pkgs.writeShellApplication {
     name = "screenshot";
     runtimeInputs = with pkgs; [ grim slurp swappy ];
