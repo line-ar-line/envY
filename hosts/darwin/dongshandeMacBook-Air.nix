@@ -23,7 +23,7 @@
 
   # --- GIT CONFIG ---
   envy.git.name = "line-ar-line";
-  envy.git.email = "linearline@dongshandeMacBook-Air.local";
+  envy.git.email = "2300011032@stu.pku.edu.cn";
 
   # --- HABITS CONFIG ---
   envy.habits.terminalScratchpad.gesture = "F12";

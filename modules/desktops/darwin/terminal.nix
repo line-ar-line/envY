@@ -100,7 +100,7 @@ in
             Guid = "E5926B63-798B-4B6B-B6B1-D181D39D377B";
             "Custom Command" = "No";
 
-            "Normal Font" = "MapleMono-NF-CN-Regular 13";
+            "Normal Font" = "MapleMono-NF-CN-Regular 16";
             "Non Ascii Font" = "Monaco 12";
             "Use Ligatures" = true;
 

@@ -15,22 +15,12 @@
             User = "git";
         };
 
-        "nas" = {
-            HostName = "nas.fl0wer.cn";
-            Port = 6611;
-            User = "chi";
-        };
-
-        "dell-1" = {
-            HostName = "202.112.47.189";
+        "my-linux" = {
+            HostName = "162.105.227.61";
             Port = 22;
-            User = "xiongxk";
-        };
-
-        "jyue" = {
-          HostName = "100.73.61.31";
-          Port = 22;
-          User = "jyxc-dz-0101541";
+            User = "linearline";
+            IdentityFile = "~/.ssh/id_ed25519";
+            IdentitiesOnly = true;
         };
     };
   };

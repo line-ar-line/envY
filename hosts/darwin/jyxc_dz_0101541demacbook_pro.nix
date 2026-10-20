@@ -20,7 +20,7 @@
 
   # --- GIT CONFIG ---
   envy.git.name = "Kie-Chi";
-  envy.git.email = "137579437@qq.com";
+  envy.git.email = "2300011032@stu.pku.edu.cn";
 
   # --- HABITS CONFIG ---
   envy.habits.terminalScratchpad.gesture = "F12";
