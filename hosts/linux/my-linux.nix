@@ -4,26 +4,22 @@
   imports = [ ../default.nix ];
 
   # BEGIN ENVY MANAGED CONFIG
-  # `envy config` updates only this block. Other machine policy stays intact.
+  # envy config updates only this block. Other machine policy stays intact.
 
   # --- BASE CONFIG ---
-  envy.user.name = "chi";
-  envy.user.home = "/home/chi";
+  envy.user.name = "linearline";
+  envy.user.home = "/home/linearline";
 
   # --- ENV CONFIG ---
-  envy.repository.path = "/home/chi/.envy";
+  envy.repository.path = "/home/linearline/.envy";
 
   # --- GIT CONFIG ---
-  envy.git.name = "Kie-Chi";
+  envy.git.name = "line-ar-line";
   envy.git.email = "2300011032@stu.pku.edu.cn";
 
-  # --- HABITS CONFIG ---
-  envy.habits.terminalScratchpad.gesture = "F12";
-  envy.habits.globalLauncher.gesture = "Option+Space";
-
   # --- LINUX CONFIG ---
-  envy.linux.desktop = "all";
-  envy.linux.option = "desktop";
+  envy.linux.desktop = "none";
+  envy.linux.option = "server";
 
   # --- MIRRORS CONFIG ---
   envy.mirrors.mode = "china";
@@ -33,9 +29,7 @@
   # END ENVY MANAGED CONFIG
 
   # BEGIN ENVY MANAGED SOFTWARE
-  # `envy setup` and `envy software` own only these machine-local selections.
-
-  envy.software.npm.tools.include = builtins.fromJSON "[{\"id\":\"chatgpt\",\"name\":\"chatgpt\",\"ref\":\"npm:chatgpt\",\"version\":\"5.2.5\"}]";
+  # envy setup and envy software own only these machine-local selections.
   # END ENVY MANAGED SOFTWARE
 
   # BEGIN ENVY MANAGED AGENTS
@@ -44,12 +38,10 @@
   # --- LLM CREDENTIALS ---
   envy.llm.credentials.deepseek.kind = "api-key";
   envy.llm.credentials.deepseek.secretPath = "llm/deepseek/apikey";
-  envy.llm.credentials.hbapi.kind = "api-key";
-  envy.llm.credentials.hbapi.secretPath = "llm/hbapi/apikey";
   envy.llm.credentials.stepfun.kind = "api-key";
   envy.llm.credentials.stepfun.secretPath = "llm/steps/apikey";
-  envy.llm.credentials.xikai.kind = "api-key";
-  envy.llm.credentials.xikai.secretPath = "llm/xikai/apikey";
+  envy.llm.credentials.tc.kind = "api-key";
+  envy.llm.credentials.tc.secretPath = "llm/tc/apikey";
 
   # --- LLM ENDPOINTS ---
   envy.llm.endpoints.deepseek-openai.baseUrl = "https://api.deepseek.com";
@@ -66,24 +58,14 @@
   # --- AGENTS ---
   envy.agents.cc.adapter = "claude-code";
   envy.agents.cc.aliases = [ "ccli" ];
-  envy.agents.cc.credential = "hbapi";
+  envy.agents.cc.credential = "tc";
   envy.agents.cc.endpoint = "sub2api-anthropic";
-  envy.agents.cc.model = "opus-5";
+  envy.agents.cc.model = "claude-fable-5-1";
   envy.agents.codex.adapter = "codex";
-  envy.agents.codex.credential = "xikai";
+  envy.agents.codex.credential = "tc";
   envy.agents.codex.endpoint = "xikai-openai";
-  envy.agents.codex.model = "gpt-6.1-sol";
-  envy.agents.codex.additionalSettings = {
-    model_auto_compact_token_limit = 244800;
-    model_context_window = 272000;
-  };
+  envy.agents.codex.model = "gpt-6-astra";
   envy.agents.pi.adapter = "pi";
-  envy.agents.pi.api = "openai-responses";
-  envy.agents.pi.credential = "xikai";
-  envy.agents.pi.endpoint = "xikai-openai";
-  envy.agents.pi.model = "gpt-6.1-sol";
-  envy.agents.pi.contextWindow = 272000;
-  envy.agents.pi.maxTokens = 128000;
   envy.agents.pi.additionalSettings = {
     compaction = {
       keepRecentTokens = 27200;
@@ -91,6 +73,11 @@
     };
     defaultTools = [ "+codemode" ];
   };
+  envy.agents.pi.contextWindow = 272000;
+  envy.agents.pi.credential = "tc";
+  envy.agents.pi.endpoint = "xikai-openai";
+  envy.agents.pi.maxTokens = 128000;
+  envy.agents.pi.model = "gpt-6.1-sol";
+  envy.agents.pi.moreThinking = true;
   # END ENVY MANAGED AGENTS
-
 }

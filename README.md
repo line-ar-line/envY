@@ -50,7 +50,7 @@ Option 遵循公共优先原则：
 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSL \
-  https://gh-proxy.com/https://raw.githubusercontent.com/Kie-Chi/envY/master/install.sh | bash
+  https://gh-proxy.com/https://raw.githubusercontent.com/line-ar-line/envY/master/install.sh | bash
 ```
 
 国内 bootstrap 默认通过 `gh-proxy.com` 获取 GitHub 仓库，并在无法访问代理时回退到
@@ -60,7 +60,7 @@ GitHub 直连；Nix binary cache、npm、PyPI、Go 和 Rust/Cargo 的首次 setu
 或者手动 clone：
 
 ```bash
-git clone https://github.com/Kie-Chi/envY.git ~/.envy
+git clone https://github.com/line-ar-line/envY.git ~/.envy
 cd ~/.envy
 bash setup.sh
 ```
