@@ -5,6 +5,7 @@ keys:
   - &jyxc_dz_0101541demacbook_pro age1ylzyf40zckj7ftxr6pas4kzev8k4g3mxre6m6g3xh9285ajw7f4q8suefx
   - &linux_desktop age1u7qkdxe3ly7j7n6g3n9gxkcvrund95fr906j2jxxa52wf2sf5drsl6895c
   - &dongshandemacbook_air age1tl6tdayqhvyxrs94a7hqw96v3f3a0p7t0kegt2n04ejvh5ludq0suy9q4f
+  - &my_linux age1swd9u99dxv3zs5e5lg2knlat3x6jgnnaeyaeq3slae6fkk3fh9xqs5ef26
 
 creation_rules:
   - path_regex: secrets/secrets\.yaml$
@@ -15,3 +16,4 @@ creation_rules:
           - *jyxc_dz_0101541demacbook_pro
           - *linux_desktop
           - *dongshandemacbook_air
+          - *my_linux
