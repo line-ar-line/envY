@@ -4,10 +4,12 @@ from collections.abc import Callable, Iterable
 import json
 
 from rich.table import Table
+from rich.text import Text
 
 from envy import log
-from envy.doctor.checks import apps, config, network, system
+from envy.doctor.checks import agents, apps, config, network, system
 from envy.doctor.model import (
+    SECTION_AGENTS,
     SECTION_AUTH,
     SECTION_CONFIG,
     SECTION_DOCTOR,
@@ -30,9 +32,10 @@ CHECKS: dict[str, CheckFn] = {
     "system": system.run_checks,
     "apps": apps.run_checks,
     "network": network.run_checks,
+    "agents": agents.run_checks,
 }
 
-DEFAULT_CHECKS = ["config", "system", "apps"]
+DEFAULT_CHECKS = ["config", "system", "apps", "agents"]
 
 
 CONFIG_RESULT_SECTIONS: set[DoctorSection] = {
@@ -83,6 +86,8 @@ def _scope_needed(section: str, selection: DoctorSelection) -> bool:
         return False
     if not selection.sections:
         return True
+    if section == "agents":
+        return SECTION_AGENTS in selection.sections
     if section == "config":
         return bool(selection.sections & CONFIG_RESULT_SECTIONS)
     if section == "apps":
@@ -108,10 +113,10 @@ def render(results: list[CheckResult]) -> None:
 
     for result in results:
         table.add_row(
-            f"[{style[result.status]}]{result.status.upper()}[/{style[result.status]}]",
-            result.section,
-            result.name,
-            result.message,
+            Text(result.status.upper(), style=style[result.status]),
+            Text(result.section),
+            Text(result.name),
+            Text(result.message),
         )
 
     log.console.print(table)
@@ -120,7 +125,7 @@ def render(results: list[CheckResult]) -> None:
     if hints:
         log.console.print("[bold]Hints[/bold]")
         for result in hints:
-            log.console.print(f"[dim]- {result.section}/{result.name}: {result.hint}[/dim]")
+            log.console.print(Text(f"- {result.section}/{result.name}: {result.hint}", style="dim"))
 
     actions: list[tuple[str, str]] = []
     for result in results:
@@ -144,7 +149,7 @@ def render(results: list[CheckResult]) -> None:
             grouped.setdefault(action, []).append(label)
         for action, labels in grouped.items():
             source = labels[0] if len(labels) == 1 else f"{len(labels)} checks"
-            log.console.print(f"[dim]- {action}  ({source})[/dim]")
+            log.console.print(Text(f"- {action}  ({source})", style="dim"))
 
     errors = sum(1 for result in results if result.failed)
     warnings = sum(1 for result in results if result.warned)

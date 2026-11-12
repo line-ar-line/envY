@@ -9,7 +9,6 @@ this file only stores non-sensitive selections and secret references.
 from __future__ import annotations
 
 import json
-import os
 import re
 import shlex
 from pathlib import Path
@@ -17,7 +16,8 @@ from typing import Any, Optional
 
 import typer
 
-from envy import log
+from envy import error, log
+from envy.agent_models import API_CHOICES, MODEL_LIMIT_FIELDS, model_bindings, profile_fields
 from envy.agent_completion import (
     complete_adapters,
     complete_agent_names,
@@ -28,36 +28,59 @@ from envy.agent_completion import (
     complete_credentials,
     complete_endpoints,
     complete_managed_agent_names,
+    complete_profile_names,
 )
-from envy.config import _escape_nix_string, machine_config_file, read_secrets_data, set_secret_value
+
+from envy.config.machine_nix import machine_config_file
+from envy.config.secret_store import read_secrets_data
+from envy.config.updates import set_secret_value
+from envy.errno import ErrorCode
 from envy.evaluation import invalidate_machine_manifest, machine_manifest
 from envy.jsonio import emit, emit_error
-from envy.legacy import (
-    AGENT_FIELD_ALIASES,
-    canonicalize_agent_object,
-    canonicalize_agent_values,
-    is_obsolete_agent,
-    normalize_agent_fields,
-    obsolete_agent_paths,
-)
 from envy.mutation import offer_mutation_commit
-from envy.nix_literals import LiteralError, LiteralReader
+from envy.nix_literals import LiteralError, LiteralReader, escape_string
 from envy.secure_io import atomic_write_text, ensure_private_directory
 from envy.transaction import FileTransaction
+from envy.structured_config import update_file
 from envy.utils import SECRETS_FILE, current_machine_id
 
 
 MANAGED_START = "  # BEGIN ENVY MANAGED AGENTS"
 MANAGED_END = "  # END ENVY MANAGED AGENTS"
 _NAME = r"[A-Za-z0-9][A-Za-z0-9_-]*"
-_PATH_RE = re.compile(r"^envy\.(agents|llm\.(?:endpoints|credentials))\." + _NAME + r"(?:\.[A-Za-z0-9_-]+)?$")
+_PATH_RE = re.compile(r"^envy\.(agents|agentProfiles|llm\.(?:endpoints|credentials))\." + _NAME + r"(?:\.[A-Za-z0-9_-]+)?$")
 _SAFE_SECRET_PATH = re.compile(r"^[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*$")
 _KNOWN_ENDPOINTS = {"stepfun-openai", "stepfun-anthropic", "deepseek-openai"}
 _KNOWN_CREDENTIALS = {"stepfun", "deepseek"}
 _RUNTIME_DIR = Path.home() / ".config" / "envy" / "agent-runtime"
 _LIVE_AGENT_FIELDS = {"model", "endpoint", "credential", "api", "contextWindow", "maxTokens"}
 _LIVE_ENDPOINT_FIELDS = {"baseUrl", "protocol"}
-API_CHOICES = ("openai-completions", "openai-responses", "anthropic-messages")
+_PROFILE_FIELDS = ("api", "contextWindow", "credential", "endpoint", "maxTokens", "model")
+_AGENT_FIELDS = (
+    "adapter", "additionalSettings", "aliases", "api", "args", "command", "contextWindow",
+    "credential", "endpoint", "maxTokens", "model", "models", "moreThinking", "profile", "skills",
+)
+_ENDPOINT_FIELDS = ("baseUrl", "protocol")
+_ENDPOINT_PROTOCOLS = ("anthropic-compatible", "native", "openai-compatible")
+_CREDENTIAL_FIELDS = ("kind", "secretPath")
+_CREDENTIAL_KINDS = ("api-key", "basic", "token")
+_NAMESPACE_RE = re.compile(
+    r"envy\.(agents|agentProfiles|llm\.(?:endpoints|credentials))\."
+    r"([A-Za-z0-9][A-Za-z0-9_-]*)(?:\.([A-Za-z0-9_-]+))?"
+)
+
+
+def _object_hint(namespace: str, name: str) -> str:
+    if namespace == "agentProfiles":
+        return (
+            "Assign each profile field separately, or run: "
+            f"envy agent profile add {name} --endpoint <endpoint> --model <model>"
+        )
+    if namespace == "agents":
+        return f"Assign each agent field separately, or run: envy agent add {name} --adapter <adapter>"
+    if namespace == "llm.endpoints":
+        return "Assign baseUrl and protocol separately."
+    return "Assign kind and secretPath separately."
 
 
 def _block_pattern() -> re.Pattern[str]:
@@ -69,30 +92,32 @@ def _read_values(path: Path | None = None) -> dict[str, Any]:
     return values
 
 
-def read_managed_values(path: Path | None = None) -> tuple[dict[str, Any], bool, list[str]]:
+def read_managed_values(path: Path | None = None) -> tuple[dict[str, Any], bool, list[error.ConfigError]]:
     """Read the agent block and report malformed content without secret values."""
     path = path or machine_config_file()
     if not path.exists():
-        return {}, False, [f"missing machine configuration: {path}"]
+        return {}, False, [
+            error.managed_block_missing(str(path), hint="Create it with: envy config refine")
+        ]
     text = path.read_text()
     starts = text.count(MANAGED_START)
     ends = text.count(MANAGED_END)
     if starts == 0 and ends == 0:
         return {}, False, []
-    if starts != 1 or ends != 1:
-        return {}, True, ["agent managed block has unbalanced or duplicate markers"]
     match = _block_pattern().search(text)
-    if not match:
-        return {}, True, ["agent managed block markers are malformed"]
+    if starts != 1 or ends != 1 or not match:
+        return {}, True, [error.managed_block_markers(str(path), starts=starts, ends=ends)]
     values: dict[str, Any] = {}
-    errors: list[str] = []
+    errors: list[error.ConfigError] = []
     block = match.group(0)
     reader = LiteralReader(block)
     base_line = text.count("\n", 0, match.start()) + 1
+
+    def line() -> int:
+        return base_line + block.count("\n", 0, reader.position)
+
     while True:
-        # peek skips comments but restores position. Keep that position to
-        # locate failures without including any assignment values in output.
-        start = reader.position
+        # Errors name the field and line only, never assignment values.
         field = "agent managed block"
         try:
             if not reader.peek():
@@ -102,203 +127,236 @@ def read_managed_values(path: Path | None = None) -> tuple[dict[str, Any], bool,
                 reader.take()
                 parts.append(reader.take())
             field = ".".join(parts)
-            if not _PATH_RE.fullmatch(field):
-                raise LiteralError("invalid managed field path")
             reader.expect("=")
             value = reader.value()
             reader.expect(";")
-            if field in values:
-                raise LiteralError("duplicate managed assignment")
-            values[field] = value
         except LiteralError as exc:
-            line = base_line + block.count("\n", 0, reader.position)
-            errors.append(f"{field}: {exc} (line {line})")
+            errors.append(error.syntax(field, str(exc), line=line()))
             # Do not attempt recovery inside a nested attrset: doing so could
             # interpret its members as independent machine assignments.
             break
+        if not _PATH_RE.fullmatch(field):
+            errors.append(
+                error.invalid_path(field, expected="envy.<namespace>.<name>.<field>", line=line())
+            )
+            break
+        if field in values:
+            errors.append(error.duplicate(field, line=line()))
+            break
+        values[field] = value
     log.debug("agents", "managed block parsed", path=str(path), fields=len(values), errors=len(errors))
     return values, True, errors
 
 
-def _migration_values(machine_values: dict[str, Any]) -> dict[str, Any]:
-    """Build the first managed block from the legacy scalar LLM settings."""
-    steps_url = str(machine_values.get("envy.llm.steps.url", "") or os.getenv("STEPFUN_BASE_URL", "") or "https://stepfun.com")
-    steps_model = str(machine_values.get("envy.llm.steps.model", "") or "step-3.7-flash")
-    deepseek_url = str(machine_values.get("envy.llm.deepseek.url", "") or "https://api.deepseek.com")
-    deepseek_model = str(machine_values.get("envy.llm.deepseek.model", "") or "deepseek-v4-pro")
-    stepfun_openai = steps_url.rstrip("/")
-    if not stepfun_openai.endswith("/v1"):
-        stepfun_openai += "/v1"
+def _initial_values() -> dict[str, Any]:
+    """Return the managed block written for a machine that has none."""
     return {
         "envy.llm.credentials.stepfun.kind": "api-key",
         "envy.llm.credentials.stepfun.secretPath": "llm/steps/apikey",
         "envy.llm.credentials.deepseek.kind": "api-key",
         "envy.llm.credentials.deepseek.secretPath": "llm/deepseek/apikey",
-        "envy.llm.endpoints.stepfun-openai.baseUrl": stepfun_openai,
+        "envy.llm.endpoints.stepfun-openai.baseUrl": "https://stepfun.com/v1",
         "envy.llm.endpoints.stepfun-openai.protocol": "openai-compatible",
-        "envy.llm.endpoints.stepfun-anthropic.baseUrl": steps_url,
+        "envy.llm.endpoints.stepfun-anthropic.baseUrl": "https://stepfun.com",
         "envy.llm.endpoints.stepfun-anthropic.protocol": "anthropic-compatible",
-        "envy.llm.endpoints.deepseek-openai.baseUrl": deepseek_url,
+        "envy.llm.endpoints.deepseek-openai.baseUrl": "https://api.deepseek.com",
         "envy.llm.endpoints.deepseek-openai.protocol": "openai-compatible",
         "envy.agents.codex.adapter": "codex",
         "envy.agents.codex.endpoint": "stepfun-openai",
         "envy.agents.codex.credential": "stepfun",
-        "envy.agents.codex.model": steps_model,
+        "envy.agents.codex.model": "step-3.7-flash",
         "envy.agents.cc.adapter": "claude-code",
         "envy.agents.cc.endpoint": "stepfun-anthropic",
         "envy.agents.cc.credential": "stepfun",
-        "envy.agents.cc.model": steps_model,
+        "envy.agents.cc.model": "step-3.7-flash",
         "envy.agents.cc.aliases": ["ccli"],
     }
 
 
-def _validate_values(values: dict[str, Any]) -> list[str]:
-    errors: list[str] = obsolete_agent_paths(values)
-    agent_names: set[str] = set()
-    endpoint_names: set[str] = set()
-    credential_names: set[str] = set()
+def _validate_issues(values: dict[str, Any]) -> list[error.ConfigError]:
+    """Return one actionable problem per invalid managed field."""
+    issues: list[error.ConfigError] = []
+    flat_agents: set[str] = set()
+    flat_profiles: set[str] = set()
+    flat_endpoints: set[str] = set()
+    flat_credentials: set[str] = set()
+    declared_profiles: set[str] = set()
+    declared_endpoints: set[str] = set()
+    declared_credentials: set[str] = set()
     for path, value in values.items():
-        match = re.fullmatch(r"envy\.(agents|llm\.(?:endpoints|credentials))\.([A-Za-z0-9][A-Za-z0-9_-]*)(?:\.([A-Za-z0-9_-]+))?", path)
+        match = _NAMESPACE_RE.fullmatch(path)
         if not match:
-            errors.append(path)
+            issues.append(error.invalid_path(path, expected="envy.<namespace>.<name>.<field>"))
             continue
         namespace, name, field = match.groups()
-        if namespace == "agents":
-            agent_names.add(name)
-            if field not in {"adapter", "api", "endpoint", "credential", "model", "contextWindow", "maxTokens", "command", "args", "aliases", "skills", "additionalSettings", "moreThinking", *AGENT_FIELD_ALIASES}:
-                errors.append(path)
-            elif field in {"contextWindow", "maxTokens"} and value is not None and (
-                isinstance(value, bool) or not isinstance(value, int) or value <= 0
-            ):
-                errors.append(path)
-            elif field in {"args", "aliases", "skills"} and (
-                not isinstance(value, list) or not all(isinstance(item, str) for item in value)
-            ):
-                errors.append(path)
-            elif field == "additionalSettings" and not isinstance(value, dict):
-                errors.append(path)
-            elif field in {"moreThinking", *AGENT_FIELD_ALIASES} and not isinstance(value, bool):
-                errors.append(path)
-            elif field == "api" and value is not None and value not in API_CHOICES:
-                errors.append(path)
-            elif field in {"adapter", "endpoint", "credential", "model", "command"} and value is not None and not isinstance(value, str):
-                errors.append(path)
+        if namespace == "agentProfiles":
+            declared_profiles.add(name)
         elif namespace == "llm.endpoints":
-            endpoint_names.add(name)
-            if field not in {"baseUrl", "protocol"} or not isinstance(value, str):
-                errors.append(path)
-            elif field == "protocol" and value not in {"openai-compatible", "anthropic-compatible", "native"}:
-                errors.append(path)
-            elif field == "baseUrl" and not value.startswith(("http://", "https://")):
-                errors.append(path)
+            declared_endpoints.add(name)
         elif namespace == "llm.credentials":
-            credential_names.add(name)
-            if field not in {"kind", "secretPath"} or not isinstance(value, str):
-                errors.append(path)
-            elif field == "kind" and value not in {"api-key", "token", "basic"}:
-                errors.append(path)
+            declared_credentials.add(name)
+        if field is None:
+            # Report the whole-object assignment once instead of inspecting
+            # members that may be legitimate values of a field-less object.
+            issues.append(error.unsupported_object(path, hint=_object_hint(namespace, name)))
+            continue
+        if namespace == "agentProfiles":
+            flat_profiles.add(name)
+            if field not in _PROFILE_FIELDS:
+                issues.append(error.unknown_field(path, _PROFILE_FIELDS))
+            elif field in MODEL_LIMIT_FIELDS:
+                if value is not None and (
+                    isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                ):
+                    issues.append(error.invalid_type(path, "a positive integer or null"))
+            elif field == "api":
+                if value is not None and value not in API_CHOICES:
+                    issues.append(error.invalid_choice(path, API_CHOICES))
+            elif value is not None and not isinstance(value, str):
+                issues.append(error.invalid_type(path, "a string or null"))
+        elif namespace == "agents":
+            flat_agents.add(name)
+            if field not in _AGENT_FIELDS:
+                issues.append(error.unknown_field(path, _AGENT_FIELDS))
+            elif field in MODEL_LIMIT_FIELDS:
+                if value is not None and (
+                    isinstance(value, bool) or not isinstance(value, int) or value <= 0
+                ):
+                    issues.append(error.invalid_type(path, "a positive integer or null"))
+            elif field in {"args", "aliases", "skills"}:
+                if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                    issues.append(error.invalid_type(path, "a list of strings"))
+            elif field == "additionalSettings":
+                if not isinstance(value, dict):
+                    issues.append(error.invalid_type(path, "an object"))
+            elif field == "moreThinking":
+                if not isinstance(value, bool):
+                    issues.append(error.invalid_type(path, "true or false"))
+            elif field == "api":
+                if value is not None and value not in API_CHOICES:
+                    issues.append(error.invalid_choice(path, API_CHOICES))
+            elif field in {"profile", "adapter", "endpoint", "credential", "model", "command"}:
+                if value is not None and not isinstance(value, str):
+                    issues.append(error.invalid_type(path, "a string or null"))
+        elif namespace == "llm.endpoints":
+            flat_endpoints.add(name)
+            if field not in _ENDPOINT_FIELDS:
+                issues.append(error.unknown_field(path, _ENDPOINT_FIELDS))
+            elif not isinstance(value, str):
+                issues.append(error.invalid_type(path, "a string"))
+            elif field == "protocol" and value not in _ENDPOINT_PROTOCOLS:
+                issues.append(error.invalid_choice(path, _ENDPOINT_PROTOCOLS))
+            elif field == "baseUrl" and not value.startswith(("http://", "https://")):
+                issues.append(error.invalid_value(path, "expected an http:// or https:// URL"))
+        else:
+            flat_credentials.add(name)
+            if field not in _CREDENTIAL_FIELDS:
+                issues.append(error.unknown_field(path, _CREDENTIAL_FIELDS))
+            elif not isinstance(value, str):
+                issues.append(error.invalid_type(path, "a string"))
+            elif field == "kind" and value not in _CREDENTIAL_KINDS:
+                issues.append(error.invalid_choice(path, _CREDENTIAL_KINDS))
             elif field == "secretPath" and not _SAFE_SECRET_PATH.fullmatch(value):
-                errors.append(path)
+                issues.append(
+                    error.invalid_value(
+                        path, "expected slash-separated letters, digits, '_' or '-'"
+                    )
+                )
 
-    declared_endpoints = {path.split(".")[3] for path in values if path.startswith("envy.llm.endpoints.")}
-    declared_credentials = {path.split(".")[3] for path in values if path.startswith("envy.llm.credentials.")}
-    for name in sorted(agent_names):
-        if f"envy.agents.{name}.adapter" not in values:
-            errors.append(f"envy.agents.{name}.adapter")
-    for name in sorted(endpoint_names):
-        if f"envy.llm.endpoints.{name}.baseUrl" not in values:
-            errors.append(f"envy.llm.endpoints.{name}.baseUrl")
-    for name in sorted(credential_names):
-        if f"envy.llm.credentials.{name}.secretPath" not in values:
-            errors.append(f"envy.llm.credentials.{name}.secretPath")
+    for name in sorted(flat_profiles):
+        for required in ("endpoint", "model"):
+            if f"envy.agentProfiles.{name}.{required}" not in values:
+                issues.append(error.missing_required(f"envy.agentProfiles.{name}", required))
+    for name in sorted(flat_agents):
+        path = f"envy.agents.{name}.adapter"
+        if path not in values:
+            issues.append(error.missing_required(path, hint=f"Run: envy agent set {path} <adapter>"))
+    for name in sorted(flat_endpoints):
+        path = f"envy.llm.endpoints.{name}.baseUrl"
+        if path not in values:
+            issues.append(error.missing_required(path, hint="Add the endpoint base URL."))
+    for name in sorted(flat_credentials):
+        path = f"envy.llm.credentials.{name}.secretPath"
+        if path not in values:
+            issues.append(
+                error.missing_required(
+                    path,
+                    hint=f"Run: envy agent credential-set {name} --secret-path <yaml-path> --stdin",
+                )
+            )
+
     for path, value in values.items():
-        if not path.startswith("envy.agents.") or not path.endswith((".endpoint", ".credential")) or not isinstance(value, str):
+        if path.startswith("envy.agents.") and path.endswith(".profile") and isinstance(value, str):
+            if value not in declared_profiles:
+                issues.append(
+                    error.unknown_reference(
+                        path, "profile", name=value, declared=f"envy.agentProfiles.{value}"
+                    )
+                )
+            continue
+        if not path.startswith(("envy.agents.", "envy.agentProfiles.")) or not path.endswith((".endpoint", ".credential")):
+            continue
+        if not isinstance(value, str):
             continue
         if path.endswith(".endpoint") and value not in declared_endpoints | _KNOWN_ENDPOINTS:
-            errors.append(path)
+            issues.append(
+                error.unknown_reference(path, "endpoint", name=value, declared=f"envy.llm.endpoints.{value}.baseUrl")
+            )
         if path.endswith(".credential") and value not in declared_credentials | _KNOWN_CREDENTIALS:
-            errors.append(path)
-    return sorted(set(errors))
+            issues.append(
+                error.unknown_reference(path, "credential", name=value, declared=f"envy.llm.credentials.{value}.secretPath")
+            )
+
+    _, agents = _managed_manifest(values)
+    for name, item in agents.items():
+        if not isinstance(item, dict) or "models" not in item:
+            continue
+        path = f"envy.agents.{name}.models"
+        if item["models"] and (name != "pi" or item.get("adapter") != "pi"):
+            issues.append(error.invalid_value(path, "only the pi agent supports a non-empty model list"))
+            continue
+        try:
+            model_bindings(_initial_values() | values, item, name=name)
+        except error.ConfigValidationError as exc:
+            if not any(issue.path == exc.issue.path and issue.code == exc.issue.code for issue in issues):
+                issues.append(exc.issue)
+        except (ValueError, TypeError) as exc:
+            issues.append(error.invalid_value(path, str(exc)))
+    return sorted(set(issues), key=lambda item: (item.path, item.message))
 
 
-def refine_managed(
-    *, machine_values: dict[str, Any], write: bool = True, path: Path | None = None,
-) -> dict[str, Any]:
+def _validate_values(values: dict[str, Any]) -> list[str]:
+    """Return the invalid paths; use _validate_issues when reporting details."""
+    return sorted({item.path for item in _validate_issues(values)})
+
+
+def refine_managed(*, write: bool = True, path: Path | None = None) -> dict[str, Any]:
     """Validate or create the agent block used by config refine/check."""
     values, present, errors = read_managed_values(path)
-    result: dict[str, Any] = {"added": [], "removed": [], "warnings": [], "errors": list(errors), "changed": False}
+    result: dict[str, Any] = {"added": [], "removed": [], "warnings": [], "errors": [], "changed": False}
     if errors:
-        for error in errors:
-            log.error("agents", "cannot parse managed agent configuration", path=str(path or machine_config_file()), reason=error)
-        log.hint("Use literal Nix settings or builtins.fromJSON in the managed agent block; no values were changed.")
+        result["errors"].extend(error.report("agents", errors))
         return result
     if not present:
-        migrated = _migration_values(machine_values)
-        invalid = _validate_values(migrated)
-        if invalid:
-            result["errors"].extend(invalid)
-            for field in invalid:
-                log.error("agents", "invalid legacy LLM migration source", field=field)
-            return result
-        result["added"] = sorted(migrated)
+        initial = _initial_values()
+        result["added"] = sorted(initial)
         if write:
-            _write_values(migrated, path=path)
+            _write_values(initial, path=path)
             result["changed"] = True
-            log.fix("agents", "created managed agent block from legacy LLM fields", count=len(migrated))
+            log.fix("agents", "created the managed agent block", count=len(initial))
         else:
-            result["errors"].append("envy agents managed block")
-            log.error("agents", "agent managed block is missing")
-            log.hint("Run: envy config refine")
+            result["errors"].extend(error.report("agents", [
+                error.managed_block_missing(
+                    "envy agents managed block", hint="Run: envy config refine"
+                )
+            ]))
         return result
 
-    # A machine may already have new selections alongside old scalar fields.
-    # Copy missing compatibility selections, keeping every explicit new value.
-    # Once the scalar migration source is gone, do not recreate deleted fields.
-    if any(machine_values.get(key) for key in (
-        "envy.llm.steps.url", "envy.llm.steps.model",
-        "envy.llm.deepseek.url", "envy.llm.deepseek.model",
-    )):
-        migrated = _migration_values(machine_values)
-        result["added"] = sorted(set(migrated) - set(values))
-        values = migrated | values
-
-    values, renamed, legacy_removed, rename_errors = normalize_agent_fields(values)
-    result["added"].extend(renamed)
-    result["removed"].extend(legacy_removed)
-    if rename_errors:
-        for field in rename_errors:
-            log.error("agents", "legacy agent field conflicts with moreThinking", field=field)
-
-    obsolete_removed = obsolete_agent_paths(values)
-    result["removed"].extend(obsolete_removed)
-    for obsolete in obsolete_removed:
-        values.pop(obsolete, None)
-
-    invalid = sorted(set(_validate_values(values) + rename_errors))
-    if invalid:
-        result["errors"].extend(invalid)
-        for path in invalid:
-            log.error("agents", "invalid agent managed field", field=path)
-        log.hint("Run: envy agent set ... or edit the managed agent block")
+    issues = _validate_issues(values)
+    if issues:
+        result["errors"].extend(error.report("agents", issues))
     else:
-        if result["added"] or result["removed"]:
-            if write:
-                _write_values(values, path=path)
-                result["changed"] = True
-                if result["added"]:
-                    log.fix("agents", "migrated missing legacy LLM selections", count=len(result["added"]))
-                for obsolete in obsolete_removed:
-                    log.fix("agents", "removed obsolete agent field", field=obsolete)
-            else:
-                result["errors"].extend(result["added"])
-                result["errors"].extend(result["removed"])
-                if result["added"]:
-                    log.error("agents", "legacy LLM selections need migration")
-                for obsolete in obsolete_removed:
-                    log.error("agents", "obsolete agent field needs cleanup", field=obsolete)
-                log.hint("Run: envy config refine")
-        if not result["errors"]:
-            log.ok("agents", "managed agent selections are valid", fields=len(values))
+        log.ok("agents", "managed agent selections are valid", fields=len(values))
     return result
 
 
@@ -326,7 +384,7 @@ def _managed_manifest(values: dict[str, Any]) -> tuple[dict[str, Any], dict[str,
     """Turn the source managed block into the same shape as the Nix manifest."""
     llm: dict[str, Any] = {"credentials": {}, "endpoints": {}}
     agents: dict[str, Any] = {}
-    for path, value in canonicalize_agent_values(values).items():
+    for path, value in values.items():
         if path.startswith("envy.llm."):
             _put_nested(llm, path.split(".")[2:], value)
         elif path.startswith("envy.agents."):
@@ -378,9 +436,9 @@ def config_view(
 
     normalized_agents: dict[str, Any] = {}
     for name, item in agents.items():
-        if not isinstance(item, dict) or is_obsolete_agent(name, item.get("adapter")):
+        if not isinstance(item, dict):
             continue
-        agent = canonicalize_agent_object(item)
+        agent = dict(item)
         if agent.get("adapter") == "pi":
             agent.setdefault("moreThinking", False)
         credential_name = agent.get("credential")
@@ -430,6 +488,8 @@ def config_view(
             )
         if agent.get("adapter") == "pi":
             add_field(f"envy.agents.{name}.moreThinking", agent["moreThinking"], ["true", "false"])
+            if name == "pi":
+                add_field(f"envy.agents.{name}.models", json.dumps(agent.get("models", []), ensure_ascii=False))
 
     return {
         "evaluated": evaluated,
@@ -452,8 +512,16 @@ def _render_value(value: Any) -> str:
     if isinstance(value, (int, float)):
         return str(value)
     if isinstance(value, list):
-        return "[ " + " ".join(_render_value(item) for item in value) + " ]"
-    return f'"{_escape_nix_string(str(value))}"'
+        def element(item: Any) -> str:
+            # Function application inside a Nix list needs parentheses, which
+            # the conservative managed reader deliberately does not evaluate.
+            if isinstance(item, dict):
+                return "{ " + " ".join(
+                    f'"{escape_string(key)}" = {_render_value(child)};' for key, child in item.items()
+                ) + " }"
+            return _render_value(item)
+        return "[ " + " ".join(element(item) for item in value) + " ]"
+    return f'"{escape_string(str(value))}"'
 
 
 def _render(values: dict[str, Any]) -> str:
@@ -461,6 +529,7 @@ def _render(values: dict[str, Any]) -> str:
     sections = [
         ("LLM CREDENTIALS", "envy.llm.credentials."),
         ("LLM ENDPOINTS", "envy.llm.endpoints."),
+        ("AGENT PROFILES", "envy.agentProfiles."),
         ("AGENTS", "envy.agents."),
     ]
     for title, prefix in sections:
@@ -507,6 +576,10 @@ def _secret_value(data: dict[str, Any], path: str | None) -> str:
 
 def _runtime_env(values: dict[str, Any], agent: dict[str, Any], secrets: dict[str, Any]) -> str:
     adapter = str(agent.get("adapter") or "")
+    bindings = model_bindings(_initial_values() | values, agent) if adapter == "pi" else []
+    if bindings:
+        values = _initial_values() | values
+        agent = agent | bindings[0]["selection"]
     endpoint_name = agent.get("endpoint")
     endpoint = {}
     if isinstance(endpoint_name, str):
@@ -518,10 +591,9 @@ def _runtime_env(values: dict[str, Any], agent: dict[str, Any], secrets: dict[st
     secret_path = _nested_value(values, "envy.llm.credentials", str(credential_name), "secretPath", "") if credential_name else ""
     api = agent.get("api") or ("anthropic-messages" if endpoint.get("protocol") == "anthropic-compatible" else "openai-completions")
     prefix = "ANTHROPIC" if api == "anthropic-messages" or adapter == "claude-code" else ("STEPFUN" if adapter == "stepgo" else "OPENAI")
-    unset_names = f"{prefix}_BASE_URL {prefix}_API_KEY {prefix}_MODEL"
-    if prefix == "ANTHROPIC":
-        unset_names += " ANTHROPIC_AUTH_TOKEN"
-    lines = [f"unset {unset_names}"]
+    lines = [
+        "unset OPENAI_BASE_URL OPENAI_API_KEY OPENAI_MODEL ANTHROPIC_BASE_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_MODEL STEPFUN_BASE_URL STEPFUN_API_KEY STEPFUN_MODEL",
+    ]
     if endpoint.get("baseUrl"):
         lines.append(f"export {prefix}_BASE_URL={shlex.quote(str(endpoint['baseUrl']))}")
     secret = _secret_value(secrets, secret_path)
@@ -534,37 +606,117 @@ def _runtime_env(values: dict[str, Any], agent: dict[str, Any], secrets: dict[st
         lines.append(f"export ENVY_AGENT_MODEL={shlex.quote(str(agent['model']))}")
     else:
         lines.append("unset ENVY_AGENT_MODEL")
+    if bindings:
+        lines.append(f"export ENVY_AGENT_PROVIDER={shlex.quote(bindings[0]['provider'])}")
+        if agent.get("models"):
+            keys = {entry["keyVariable"]: entry["selection"]["credential"] for entry in bindings}
+            for variable, credential in keys.items():
+                if credential is not None:
+                    path = values.get(f"envy.llm.credentials.{credential}.secretPath")
+                    lines.append(f"export {variable}={shlex.quote(_secret_value(secrets, path))}")
     lines.append("export GPT_IMAGE_MODEL_NAME=gpt-image-2")
     return "\n".join(lines) + "\n"
 
 
+def _pi_model_data(agent: dict[str, Any], api: str) -> dict[str, Any]:
+    model = agent.get("model") or ""
+    model_data: dict[str, Any] = {
+        "id": model,
+        "name": model,
+        "reasoning": True,
+        "input": ["text", "image"],
+    }
+    if api == "anthropic-messages":
+        model_data["compat"] = {"forceAdaptiveThinking": True}
+    if isinstance(agent.get("contextWindow"), int):
+        model_data["contextWindow"] = agent["contextWindow"]
+    if isinstance(agent.get("maxTokens"), int):
+        model_data["maxTokens"] = agent["maxTokens"]
+    # Keep in sync with modules/agents/providers/pi/default.nix: adaptive-thinking Anthropic
+    # models reject the thinking.type=disabled request Pi sends for "off".
+    thinking_level_map: dict[str, str | None] = {"off": None} if api == "anthropic-messages" else {}
+    if agent.get("moreThinking"):
+        thinking_level_map.update({"xhigh": "xhigh", "max": "max", "ultra": "ultra"})
+    if api in ("openai-completions", "openai-responses") and (
+        model == "gpt-6.1-sol" or model.startswith("gpt-6.1-sol-")
+    ):
+        # Sol cannot disable reasoning or use minimal/ultra.
+        thinking_level_map.update({"off": None, "minimal": None, "ultra": None})
+    if thinking_level_map:
+        model_data["thinkingLevelMap"] = thinking_level_map
+    return model_data
+
+
+def _runtime_pi_models(values: dict[str, Any], agent: dict[str, Any]) -> dict[str, Any]:
+    providers: dict[str, Any] = {}
+    for entry in model_bindings(_initial_values() | values, agent):
+        provider = providers.setdefault(entry["provider"], {
+            "baseUrl": entry["endpoint"]["baseUrl"] or "https://api.openai.com/v1",
+            "api": entry["api"],
+            "apiKey": entry["apiKey"],
+            "models": [],
+        })
+        provider["models"].append(_pi_model_data(agent | entry["selection"], entry["api"]))
+    return {"providers": providers}
+
+
 def refresh_runtime(*, values: dict[str, Any] | None = None) -> list[str]:
-    """Refresh private agent runtime overrides without evaluating or applying Nix."""
+    """Refresh private overrides; keep Pi's non-envY providers and roll back failures."""
     values = values if values is not None else _read_values()
+    issues = _validate_issues(values)
+    if issues:
+        raise error.ConfigValidationError(issues[0])
+    profiles = _profile_values(values)
+    _, agents = _managed_manifest(values)
+    for item in agents.values():
+        profile_name = item.get("profile")
+        # Pi resolves its profile per binding; eager merging would replace
+        # the shared limits with the default profile's limits for every model.
+        if item.get("adapter") != "pi" and isinstance(profile_name, str) and profile_name in profiles:
+            item.update(_profile_agent_fields(profiles[profile_name]))
+    pi_agent = agents.get("pi", {})
+    pi_data = _runtime_pi_models(values, pi_agent) if pi_agent.get("adapter") == "pi" else None
     secrets, decrypt_ok = read_secrets_data()
-    if not isinstance(secrets, dict):
-        secrets = {}
     if not decrypt_ok:
-        log.warn("agents", "runtime credentials were not refreshed; sops decryption failed")
-    agents: dict[str, dict[str, Any]] = {}
-    for path, value in values.items():
-        parts = path.split(".")
-        if len(parts) == 4 and parts[:2] == ["envy", "agents"]:
-            agents.setdefault(parts[2], {})[parts[3]] = value
+        log.warn("agents", "runtime configuration was not refreshed; sops decryption failed")
+        return []
+    secrets = secrets if isinstance(secrets, dict) else {}
+    rendered = {name: _runtime_env(values, item, secrets) for name, item in agents.items() if item.get("adapter")}
+    targets = [_RUNTIME_DIR / f"{name}.env" for name in rendered]
+    pi_models = Path.home() / ".pi" / "agent" / "models.json"
+    if pi_data is not None:
+        targets.append(pi_models)
     ensure_private_directory(_RUNTIME_DIR)
-    written: list[str] = []
-    for name, agent in agents.items():
-        if not agent.get("adapter"):
-            continue
-        target = _RUNTIME_DIR / f"{name}.env"
-        atomic_write_text(target, _runtime_env(values, agent, secrets), mode=0o600, private_parent=True)
-        written.append(name)
-    return written
+    with FileTransaction(targets) as transaction:
+        if pi_data is not None:
+            ensure_private_directory(pi_models.parent)
+            update_file(pi_models, pi_data, managed_key_prefixes={"providers": "envy-pi"})
+            pi_models.chmod(0o600)
+        for name, env in rendered.items():
+            atomic_write_text(_RUNTIME_DIR / f"{name}.env", env, mode=0o600, private_parent=True)
+        transaction.commit()
+    return list(rendered)
+
+def _profile_values(values: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    profiles: dict[str, dict[str, Any]] = {}
+    prefix = "envy.agentProfiles."
+    for path, value in values.items():
+        if path.startswith(prefix):
+            parts = path.split(".")
+            if len(parts) == 4:
+                profiles.setdefault(parts[2], {})[parts[3]] = value
+    return profiles
+
+
+def _profile_agent_fields(profile: dict[str, Any]) -> dict[str, Any]:
+    return profile_fields(profile)
 
 
 def _runtime_change_kind(path: str) -> str:
     parts = path.split(".")
-    if len(parts) == 4 and parts[:2] == ["envy", "agents"] and parts[3] in _LIVE_AGENT_FIELDS:
+    if len(parts) == 4 and parts[:2] == ["envy", "agents"] and parts[3] in _LIVE_AGENT_FIELDS | {"models", "profile"}:
+        return "live"
+    if len(parts) == 4 and parts[:2] == ["envy", "agentProfiles"] and parts[3] in _LIVE_AGENT_FIELDS:
         return "live"
     if len(parts) == 5 and parts[:3] == ["envy", "llm", "endpoints"] and parts[4] in _LIVE_ENDPOINT_FIELDS:
         return "live"
@@ -573,15 +725,29 @@ def _runtime_change_kind(path: str) -> str:
 
 def _validate_path(path: str) -> None:
     if not _PATH_RE.fullmatch(path):
-        raise typer.BadParameter(f"invalid envY agent path: {path}")
+        raise typer.BadParameter(
+            error.summary([
+                error.invalid_path(
+                    path,
+                    expected=(
+                        "envy.<agents|agentProfiles|llm.endpoints|llm.credentials>"
+                        ".<name>.<field>"
+                    ),
+                )
+            ])
+        )
 
 
 def _set(path: str, value: Any) -> Path:
     _validate_path(path)
-    legacy_field = next((field for field in AGENT_FIELD_ALIASES if path.endswith("." + field)), None)
-    if legacy_field is not None:
+    whole_object = _NAMESPACE_RE.fullmatch(path)
+    if whole_object is not None and whole_object.group(3) is None:
         raise typer.BadParameter(
-            f"{path} was renamed to {path[:-len(legacy_field)]}{AGENT_FIELD_ALIASES[legacy_field]}; run envy config refine first"
+            error.summary([
+                error.unsupported_object(
+                    path, hint=_object_hint(whole_object.group(1), whole_object.group(2))
+                )
+            ])
         )
     if path.startswith("envy.agents."):
         field = path.rsplit(".", 1)[-1]
@@ -590,21 +756,40 @@ def _set(path: str, value: Any) -> Path:
                 try:
                     value = json.loads(value)
                 except json.JSONDecodeError as exc:
-                    raise typer.BadParameter(f"{path} requires a JSON array of strings") from exc
+                    raise typer.BadParameter(error.summary([
+                        error.invalid_type(path, "a JSON array of strings")
+                    ])) from exc
             if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
-                raise typer.BadParameter(f"{path} requires a JSON array of strings")
-        elif field in {"endpoint", "credential", "model", "api", "contextWindow", "maxTokens"}:
+                raise typer.BadParameter(error.summary([
+                    error.invalid_type(path, "a JSON array of strings")
+                ]))
+        elif field == "models":
+            try:
+                value = json.loads(value) if isinstance(value, str) else value
+            except (ValueError, TypeError):
+                raise typer.BadParameter(error.summary([
+                    error.invalid_type(path, "a JSON array of model objects")
+                ])) from None
+            if not isinstance(value, list):
+                raise typer.BadParameter(error.summary([
+                    error.invalid_type(path, "a JSON array of model objects")
+                ]))
+        elif field in {"profile", "endpoint", "credential", "model", "api", "contextWindow", "maxTokens"}:
             if value == "null":
                 value = None
             elif field in {"contextWindow", "maxTokens"}:
                 try:
                     value = int(value)
                 except (TypeError, ValueError):
-                    raise typer.BadParameter(f"{path} must be a positive integer or null") from None
+                    raise typer.BadParameter(error.summary([
+                        error.invalid_type(path, "a positive integer or null")
+                    ])) from None
                 if value <= 0:
-                    raise typer.BadParameter(f"{path} must be a positive integer or null")
+                    raise typer.BadParameter(error.summary([
+                        error.invalid_type(path, "a positive integer or null")
+                    ]))
     if path.startswith("envy.agents.") and path.endswith(".api") and value is not None and value not in API_CHOICES:
-        raise typer.BadParameter(f"api must be one of: {', '.join(API_CHOICES)}")
+        raise typer.BadParameter(error.summary([error.must_be_one_of("api", API_CHOICES)]))
     if path.startswith("envy.agents.") and path.endswith(".additionalSettings"):
         try:
             value = json.loads(value) if isinstance(value, str) else value
@@ -612,23 +797,27 @@ def _set(path: str, value: Any) -> Path:
                 raise ValueError
             json.dumps(value, allow_nan=False)
         except (ValueError, TypeError):
-            raise typer.BadParameter("additionalSettings must be a JSON object") from None
+            raise typer.BadParameter(error.summary([
+                error.invalid_type(path, "a JSON object")
+            ])) from None
     if path.startswith("envy.agents.") and path.endswith(".moreThinking"):
         if isinstance(value, str) and value in {"true", "false"}:
             value = value == "true"
         if not isinstance(value, bool):
-            raise typer.BadParameter(f"{path} must be true or false")
-    values, _present, errors = read_managed_values()
-    if errors:
-        raise ValueError("cannot edit malformed agent managed block")
-    if path.startswith("envy.agents."):
-        name = path.split(".")[2]
-        adapter = value if path.endswith(".adapter") else values.get(f"envy.agents.{name}.adapter")
-        if is_obsolete_agent(name, adapter):
-            raise typer.BadParameter("OMP is retired; run envy config refine to remove its obsolete configuration")
+            raise typer.BadParameter(error.summary([error.invalid_type(path, "true or false")]))
+    values, _present, parse_errors = read_managed_values()
+    if parse_errors:
+        raise typer.BadParameter(
+            error.summary(parse_errors, prefix="cannot edit malformed agent managed block")
+        )
+    if path.startswith("envy.agents.") and path.rsplit(".", 1)[-1] in _LIVE_AGENT_FIELDS:
+        agent_prefix = f"envy.agents.{path.split('.')[2]}."
+        if values.get(agent_prefix + "adapter") != "pi" or path.rsplit(".", 1)[-1] not in MODEL_LIMIT_FIELDS:
+            values.pop(agent_prefix + "profile", None)
     values[path] = value
-    if path in _validate_values(values):
-        raise typer.BadParameter(f"invalid agent configuration field: {path}")
+    issues = _validate_issues(values)
+    if issues:
+        raise typer.BadParameter(error.summary(issues, prefix="invalid agent configuration"))
     return _write_values(values)
 
 
@@ -642,9 +831,9 @@ def _manifest_agents() -> dict[str, Any]:
     secret_data, decrypt_ok = read_secrets_data()
     result = {}
     for name, agent in agents.items():
-        if not isinstance(agent, dict) or is_obsolete_agent(name, agent.get("adapter")):
+        if not isinstance(agent, dict):
             continue
-        value = canonicalize_agent_object(agent)
+        value = dict(agent)
         credential_name = value.get("credential")
         secret_path = credentials.get(credential_name, {}).get("secretPath") if isinstance(credentials, dict) else None
         current = secret_data if decrypt_ok and isinstance(secret_data, dict) else {}
@@ -665,13 +854,120 @@ def _payload(values: dict[str, Any], agents: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-app = typer.Typer(name="agent", help="Manage machine-owned LLM agent instances and connections")
+app = typer.Typer(name="agent", help="Manage machine-owned agent instances and connections")
+profile_app = typer.Typer(name="profile", help="Manage reusable agent model profiles")
+app.add_typer(profile_app, name="profile")
+
+
+@profile_app.command(name="list")
+@profile_app.command(name="ls", rich_help_panel="Aliases")
+def cmd_profile_list(json_output: bool = typer.Option(False, "--json")):
+    values = _profile_values(_read_values())
+    if json_output:
+        emit("agent.profile.list", data={"profiles": values})
+        return
+    for name, profile in sorted(values.items()):
+        log.console.print(f"{name}: {profile.get('model', '')} via {profile.get('endpoint', '')}")
+
+
+@profile_app.command(name="add")
+def cmd_profile_add(
+    name: str = typer.Argument(...),
+    endpoint: str = typer.Option(..., "--endpoint", autocompletion=complete_endpoints),
+    model: str = typer.Option(..., "--model"),
+    credential: Optional[str] = typer.Option(None, "--credential", autocompletion=complete_credentials),
+    api: Optional[str] = typer.Option(None, "--api", autocompletion=complete_apis),
+    context_window: Optional[int] = typer.Option(None, "--context-window"),
+    max_tokens: Optional[int] = typer.Option(None, "--max-tokens"),
+    json_output: bool = typer.Option(False, "--json"),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+):
+    if not re.fullmatch(_NAME, name):
+        raise typer.BadParameter(error.summary([error.invalid_name("profile", name)]))
+    if api is not None and api not in API_CHOICES:
+        raise typer.BadParameter(error.summary([error.must_be_one_of("api", API_CHOICES)]))
+    if context_window is not None and context_window <= 0:
+        raise typer.BadParameter(error.summary([error.positive_integer("context window")]))
+    if max_tokens is not None and max_tokens <= 0:
+        raise typer.BadParameter(error.summary([error.positive_integer("max tokens")]))
+    values = _read_values()
+    prefix = f"envy.agentProfiles.{name}."
+    if any(path.startswith(prefix) for path in values):
+        raise typer.BadParameter(error.summary([
+            error.already_exists(
+                "agent profile", name,
+                hint=f"Run: envy agent set {prefix}<field> <value>",
+            )
+        ]))
+    values.update({
+        prefix + "endpoint": endpoint,
+        prefix + "model": model,
+        prefix + "credential": credential,
+        prefix + "api": api,
+        prefix + "contextWindow": context_window,
+        prefix + "maxTokens": max_tokens,
+    })
+    issues = _validate_issues(values)
+    if issues:
+        raise typer.BadParameter(error.summary(issues, prefix="invalid profile configuration"))
+    target = _write_values(values)
+    offer_mutation_commit([target], f"chore(agent): add profile {name}", quiet=json_output or yes)
+    if json_output:
+        emit("agent.profile.add", data={"name": name})
+    else:
+        log.ok("agents", "profile added", profile=name)
+        log.hint("Use: envy agent profile use <agent> " + name)
+
+
+@profile_app.command(name="use")
+def cmd_profile_use(
+    agent_name: str = typer.Argument(..., metavar="AGENT", autocompletion=complete_managed_agent_names),
+    profile_name: str = typer.Argument(..., metavar="PROFILE", autocompletion=complete_profile_names),
+    json_output: bool = typer.Option(False, "--json"),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+):
+    values = _read_values()
+    profiles = _profile_values(values)
+    profile = profiles.get(profile_name)
+    if profile is None:
+        raise typer.BadParameter(error.summary([
+            error.not_found("agent profile", profile_name, hint="Run: envy agent profile list")
+        ]))
+    agent_prefix = f"envy.agents.{agent_name}."
+    if not values.get(agent_prefix + "adapter"):
+        raise typer.BadParameter(error.summary([
+            error.not_found("managed agent", agent_name, hint="Run: envy agent list")
+        ]))
+    for field, value in _profile_agent_fields(profile).items():
+        if values[agent_prefix + "adapter"] != "pi" or field not in MODEL_LIMIT_FIELDS:
+            values[agent_prefix + field] = value
+    values[agent_prefix + "profile"] = profile_name
+    issues = _validate_issues(values)
+    if issues:
+        raise typer.BadParameter(error.summary(issues, prefix="profile cannot be applied"))
+    target = _write_values(values)
+    refreshed = refresh_runtime(values=values)
+    offer_mutation_commit([target], f"chore(agent): use profile {profile_name} for {agent_name}", quiet=json_output or yes)
+    if json_output:
+        emit("agent.profile.use", data={"agent": agent_name, "profile": profile_name, "runtimeRefreshed": bool(refreshed)})
+    else:
+        log.ok("agents", "profile switched", agent=agent_name, profile=profile_name)
+        log.ok("agents", "runtime configuration refreshed", agents=", ".join(refreshed) or "none")
+        log.hint("Changes apply to newly started agent processes.")
+        log.hint("Review and commit the machine configuration when ready.")
 
 
 @app.command(name="refresh")
 def cmd_refresh(json_output: bool = typer.Option(False, "--json")):
     """Refresh private runtime overrides without running Nix apply."""
-    refreshed = refresh_runtime()
+    try:
+        refreshed = refresh_runtime()
+    except error.ConfigValidationError as exc:
+        if json_output:
+            emit_error("agent.refresh", str(exc), code=exc.issue.code.value)
+        else:
+            error.report("agents", [exc.issue])
+        raise typer.Exit(code=1) from exc
     if json_output:
         emit("agent.refresh", data={"agents": refreshed})
     else:
@@ -695,18 +991,38 @@ def cmd_list(json_output: bool = typer.Option(False, "--json")):
 
 
 @app.command(name="show")
-def cmd_show(name: str = typer.Argument(..., autocompletion=complete_agent_names), json_output: bool = typer.Option(False, "--json")):
-    """Show one evaluated agent and its non-sensitive selections."""
+@app.command(name="sh", rich_help_panel="Aliases")
+def cmd_show(
+    name: str = typer.Argument(..., autocompletion=complete_agent_names),
+    detail: bool = typer.Option(
+        False, "--detail", "--details", "-d", help="Include runtime files, settings, and adapter metadata",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit the complete agent as machine-readable JSON"),
+):
+    """Show common agent selections; use --detail for all non-sensitive fields."""
     agents = _manifest_agents()
     if name not in agents:
+        message = error.summary([error.not_found("agent", name, hint="Run: envy agent list")])
         if json_output:
-            emit_error("agent.show", f"unknown agent: {name}", code="not-found")
+            emit_error("agent.show", message, code=ErrorCode.NOT_FOUND.value)
             raise typer.Exit(code=1)
-        raise typer.BadParameter(f"unknown agent: {name}")
+        raise typer.BadParameter(message)
     if json_output:
         emit("agent.show", data={"name": name, "agent": agents[name]})
     else:
-        log.console.print_json(json.dumps({"name": name, "agent": agents[name]}, ensure_ascii=False))
+        selected = agents[name]
+        if not detail:
+            fields = (
+                "adapter", "command", "aliases", "profile", "model", "models", "api",
+                "contextWindow", "maxTokens", "moreThinking", "endpoint", "credential",
+                "endpointConfigured", "credentialSet",
+            )
+            selected = {
+                field: selected[field]
+                for field in fields
+                if field in selected and selected[field] is not None and selected[field] != []
+            }
+        log.console.print_json(json.dumps({"name": name, "agent": selected}, ensure_ascii=False))
 
 
 @app.command(name="set")
@@ -718,10 +1034,10 @@ def cmd_set(
 ):
     """Set one agent, endpoint, or credential metadata field."""
     try:
-        target = _set(path, value)
+        _set(path, value)
     except (OSError, ValueError, typer.BadParameter) as exc:
         if json_output:
-            emit_error("agent.set", str(exc), code="invalid-value")
+            emit_error("agent.set", str(exc), code=ErrorCode.INVALID_VALUE.value)
             raise typer.Exit(code=1) from exc
         raise
     changed_kind = _runtime_change_kind(path)
@@ -751,15 +1067,17 @@ def cmd_add(
 ):
     """Create an agent instance from an adapter and optional LLM selection."""
     if not re.fullmatch(_NAME, name):
-        raise typer.BadParameter(f"invalid agent name: {name}")
-    if is_obsolete_agent(name, adapter):
-        raise typer.BadParameter("OMP is retired and cannot be added")
+        raise typer.BadParameter(error.summary([error.invalid_name("agent", name)]))
     values = _read_values()
     prefix = f"envy.agents.{name}."
     if any(key.startswith(prefix) for key in values):
-        raise typer.BadParameter(f"agent already exists: {name}")
+        raise typer.BadParameter(error.summary([
+            error.already_exists(
+                "managed agent", name, hint=f"Run: envy agent remove {name} first"
+            )
+        ]))
     if api is not None and api not in API_CHOICES:
-        raise typer.BadParameter(f"api must be one of: {', '.join(API_CHOICES)}")
+        raise typer.BadParameter(error.summary([error.must_be_one_of("api", API_CHOICES)]))
     values[prefix + "adapter"] = adapter
     for field, value in (("api", api), ("endpoint", endpoint), ("credential", credential), ("model", model), ("command", command)):
         if value is not None:
@@ -778,10 +1096,13 @@ def cmd_remove(name: str = typer.Argument(..., autocompletion=complete_managed_a
     prefix = f"envy.agents.{name}."
     removed = [key for key in values if key.startswith(prefix)]
     if not removed:
+        message = error.summary([
+            error.not_found("managed agent", name, hint="Run: envy agent list")
+        ])
         if json_output:
-            emit_error("agent.remove", f"unknown managed agent: {name}", code="not-found")
+            emit_error("agent.remove", message, code=ErrorCode.NOT_FOUND.value)
             raise typer.Exit(code=1)
-        raise typer.BadParameter(f"unknown managed agent: {name}")
+        raise typer.BadParameter(message)
     for key in removed:
         values.pop(key, None)
     target = _write_values(values)
@@ -799,15 +1120,29 @@ def cmd_credential_set(
 ):
     """Create/update a logical credential and set its encrypted value."""
     if not stdin:
-        raise typer.BadParameter("credential values require --stdin")
+        raise typer.BadParameter(error.summary([
+            error.invalid_argument(
+                "credential values require --stdin",
+                hint="Pipe the value instead of passing it on the command line.",
+            )
+        ]))
     if not re.fullmatch(r"[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)*", secret_path):
-        raise typer.BadParameter("secret path must contain slash-separated safe names")
+        raise typer.BadParameter(error.summary([
+            error.invalid_value(
+                f"envy.llm.credentials.{name}.secretPath",
+                "expected slash-separated letters, digits, '_' or '-'",
+            )
+        ]))
     value = __import__("sys").stdin.read().rstrip("\r\n")
     machine_path = machine_config_file()
     with FileTransaction([machine_path, SECRETS_FILE]) as transaction:
         set_secret_value(secret_path, value)
         _set(f"envy.llm.credentials.{name}.secretPath", secret_path)
         transaction.commit()
-    offer_mutation_commit([machine_path, SECRETS_FILE], f"chore(agent): update credential {name}", quiet=json_output)
+    refreshed = refresh_runtime()
+    if not json_output:
+        log.ok("agents", "credential runtime configuration refreshed", agents=", ".join(refreshed) or "none")
+        log.hint("Changes apply to newly started agent processes.")
+        log.hint("Review and commit the machine configuration and encrypted secret when ready.")
     if json_output:
-        emit("agent.credential-set", data={"name": name, "secretPath": secret_path, "set": bool(value)})
+        emit("agent.credential-set", data={"name": name, "secretPath": secret_path, "set": bool(value), "runtimeRefreshed": bool(refreshed)})

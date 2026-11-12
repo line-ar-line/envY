@@ -22,7 +22,7 @@ def _managed_values():
 
 
 def _metadata():
-    from envy.agent import _managed_manifest, is_obsolete_agent
+    from envy.agent import _managed_manifest
 
     try:
         manifest = machine_manifest(completion=True) or {}
@@ -41,11 +41,8 @@ def _metadata():
                 result[name] = result.get(name, {}) | item
         return result
 
-    agents = merge(manifest.get("agents", {}), local_agents)
-    obsolete_agents = {name for name, item in agents.items() if is_obsolete_agent(name, item.get("adapter"))}
     return {
-        "agents": {name: item for name, item in agents.items() if name not in obsolete_agents},
-        "obsolete_agents": obsolete_agents,
+        "agents": merge(manifest.get("agents", {}), local_agents),
         "endpoints": merge(llm.get("endpoints", {}), local_llm["endpoints"]),
         "credentials": merge(llm.get("credentials", {}), local_llm["credentials"]),
     }
@@ -84,6 +81,16 @@ def complete_credentials(ctx, incomplete):
     return _matches(_metadata()["credentials"], incomplete, "credential reference")
 
 
+def complete_profile_names(ctx, incomplete):
+    from envy.agent import _profile_values
+
+    return _matches(_profile_values(_managed_values()), incomplete, "agent profile")
+
+
+def complete_managed_profile_names(ctx, incomplete):
+    return complete_profile_names(ctx, incomplete)
+
+
 def complete_credential_paths(ctx, incomplete):
     from envy.schemas.config import SECRET_FIELDS
 
@@ -94,19 +101,28 @@ def complete_credential_paths(ctx, incomplete):
 
 
 def complete_agent_paths(ctx, incomplete):
-    prefixes = ("envy.agents.", "envy.llm.endpoints.", "envy.llm.credentials.")
+    prefixes = ("envy.agents.", "envy.agentProfiles.", "envy.llm.endpoints.", "envy.llm.credentials.")
     if not any(prefix.startswith(incomplete) or incomplete.startswith(prefix) for prefix in prefixes):
         return []
     metadata = _metadata()
+    from envy.agent import _profile_values
+
     paths = {}
     for name, agent in metadata["agents"].items():
-        fields = list(_AGENT_FIELDS)
+        fields = list(_AGENT_FIELDS) + ["profile"]
         if agent.get("adapter") == "pi":
             fields.append("api")
         if agent.get("adapter") == "pi":
             fields.append("moreThinking")
+            if name == "pi":
+                fields.append("models")
         for field in fields:
             paths[f"envy.agents.{name}.{field}"] = "agent setting"
+    profiles = _profile_values(_managed_values())
+    for name in profiles:
+        paths[f"envy.agentProfiles.{name}"] = "agent profile"
+        for field in ("endpoint", "credential", "api", "model", "contextWindow", "maxTokens"):
+            paths[f"envy.agentProfiles.{name}.{field}"] = "agent profile setting"
     for group, fields in (("endpoints", ("baseUrl", "protocol")), ("credentials", ("kind", "secretPath"))):
         for name in metadata[group]:
             for field in fields:
@@ -117,20 +133,26 @@ def complete_agent_paths(ctx, incomplete):
 def complete_agent_values(ctx, incomplete):
     params = getattr(ctx, "params", {})
     path = params.get("path", "") if isinstance(params, dict) else ""
-    match = re.fullmatch(r"envy\.(agents|llm\.endpoints|llm\.credentials)\.([A-Za-z0-9][A-Za-z0-9_-]*)\.([A-Za-z0-9_-]+)", path or "")
+    match = re.fullmatch(r"envy\.(agents|agentProfiles|llm\.endpoints|llm\.credentials)\.([A-Za-z0-9][A-Za-z0-9_-]*)\.([A-Za-z0-9_-]+)", path or "")
     if not match:
         return []
     namespace, name, field = match.groups()
+    if namespace == "agentProfiles":
+        if field == "endpoint":
+            return complete_endpoints(ctx, incomplete)
+        if field == "credential":
+            return complete_credentials(ctx, incomplete)
+        if field == "api":
+            return complete_apis(ctx, incomplete)
+        return []
     if namespace == "agents":
-        from envy.agent import is_obsolete_agent
-
         if field in {"model", "contextWindow", "maxTokens", "command", "additionalSettings"}:
             return []
-        if is_obsolete_agent(name) or field not in {"adapter", "api", "endpoint", "credential", "moreThinking"}:
+        if field == "profile":
+            return complete_profile_names(ctx, incomplete)
+        if field not in {"adapter", "api", "endpoint", "credential", "moreThinking", "profile"}:
             return []
         metadata = _metadata()
-        if name in metadata["obsolete_agents"]:
-            return []
         callbacks = {"adapter": complete_adapters, "api": complete_apis}
         if field in callbacks:
             return callbacks[field](ctx, incomplete)

@@ -1,415 +1,167 @@
 # Agents module
 
-`modules/agents` owns command-line/desktop agent installation, provider-specific wrappers, and reusable skills. Authentication files, history, caches, sessions, and plugin runtime state remain application-owned.
+envY 的 modules/agents 管理 agent 安装、provider wrapper、skill catalog 和运行时设置。应用 auth、history、cache、session 与 plugin state 由应用自己管理。
 
-## Layout
+## 结构
 
-```text
-modules/agents/
-├── default.nix          # shared provider defaults and skill selection
-├── options.nix          # machine-owned agent instance schema
-├── darwin.nix           # Darwin application distribution for nix-darwin
-├── linux.nix            # Linux CLI/IDE distribution and runtime plugins
-├── codex.nix            # Codex CLI adapter and runtime environment
-├── linux/rtk.nix        # Linux-only RTK package
-├── claude.nix           # Claude package, wrapper defaults, and ccli alias
-├── generic.nix           # OpenAI-compatible and StepGo adapters
-├── pi.nix              # Pi wrapper, prompt, and provider metadata
-├── prompts.nix         # shared and provider-specific system prompt loader
-├── prompts/            # shared, Claude, Pi, and Codex instructions
-├── pi-extensions.nix   # selected extensions from the locked upstream Pi source
-├── skills.nix           # skill catalog/selection Home Manager module
-└── skills/
-    ├── catalog.nix      # skill registry and target agents
-    └── <skill-name>/
-        ├── SKILL.md
-        ├── agents/openai.yaml  # recommended for Codex UI metadata
-        ├── scripts/            # optional deterministic helpers
-        ├── references/         # optional, read only when needed
-        └── assets/             # optional output resources
-```
+- default.nix：只负责组合子模块和平台分发；darwin/、linux/ 只放平台独有实现。
+- defaults.nix：共享的 endpoint、credential、agent 实例默认值与 active skills。
+- options.nix：`envy.agents`、`envy.agentProfiles` 与 amux 选项。
+- runtime-files.nix：把 additionalSettings 与 adapter 声明的 runtime 文件合并进应用自有配置。
+- diagnostics.nix：从已选 skills 和最终 Home Manager source 生成 Claude/Codex 的只读链接契约，共享 Claude 目录按目标去重。
+- wrapper.nix、prompts.nix：provider 共用的 wrapper 生成、endpoint/credential 解析、别名和 system prompt 拼接；`tests/wrappers.nix` 用假 agent 验证 env 文件加载次数、覆盖顺序和参数顺序。
+- providers/：claude.nix、codex.nix、generic.nix 与 pi/。pi/default.nix 生成 wrapper 和 models.json；pi/package.nix 给 Pi 打补丁；pi/extensions.nix 链接 Pi 扩展；pi/subagents.nix 管理 pi-subagents 与角色；pi/diagnostics.nix 生成只含非敏感资源来源的运行契约，供 Agent Doctor 比对实际部署。官方示例来自锁定的 Pi source；第三方 npm 包（goal-x、btw、pi-subagents、pi-queue-steer-factory、pi-powerline）由 pi/npm-extension.nix 按固定版本和 registry sha512 解包，链接为 `~/.pi/agent/extensions/envy-<name>`。
+- skills/：default.nix 按 adapter 解析 active skill 并建立 Home Manager discovery links；catalog.nix 是 skill 名称到上游目录的映射；read/、browser/ 是本仓库自带的 skill。
+- tools/：default.nix 管理 registry 安装的 agent 工具（codegraph、headroom）；obelisk.nix 从固定 npm tarball 打包会话历史检索 CLI `obelisk`，索引 `~/.obelisk/` 与项目内 `.obelisk/memories/` 归应用和用户所有；web.nix 管理 envy-read、受审查的 MCP 工具、mcp-nixos 与 deepseek-search。deepseek-search 只接入 Pi，复用 `llm-credential-deepseek`，启动时从 sops 文件读取 key，按成功调用计费。
+- amux/：容器化 agent 客户端、镜像和测试。
+- darwin/：nix-darwin.nix 声明 Codex/ChatGPT cask；pi-cron.nix 链接 cron 扩展，并以 Home Manager LaunchAgent `dev.pi.cron` 托管其 daemon，定时任务通过 envY `pi` wrapper 运行。
+- linux/：Codex wrapper（Darwin 用 cask 安装 Codex）、rtk 与桌面机的 Cursor。
+- files/agents/：非 Nix 静态文件，包括 provider prompt（prompts/）和 Pi 补丁（patches/）。
 
-## Skill loading model
+## Pi 补丁
 
-There are two distinct selection stages:
+pi/package.nix 在 Pi 的 workspace 构建阶段打补丁，库和打包后的 CLI 会一起重新编译。上游求值时会从 `source` 读取 package 与 lock 文件，所以不能给 `source` 套补丁派生，否则会变成 import-from-derivation，导致在另一平台上无法求值那个平台的机器。
 
-1. `agents.skills.active` selects shared catalog entries, filtered by each entry's supported targets. `envy.agents.<name>.skills` adds compatible catalog entries to that selection. Home Manager links the resolved set into `~/.codex/skills`, `~/.claude/skills`, `~/.stepgo/skills`, and `~/.pi/agent/skills` during activation. Instances of the same adapter share a directory and therefore share the union of their selections; `claude` and `claude-code` identify the same skill target.
-2. For a discovered skill, the agent sees its `name` and `description` metadata first. It reads the `SKILL.md` body only when the task triggers that skill, then reads referenced resources as needed.
+- pi-anthropic-sse-crlf.patch：始终启用。Anthropic SSE 的 CRLF 被网络分包拆开时，上游会把 LF 当作空行，提前派发一个没有 data 的事件，报 `Could not parse Anthropic SSE event ...: Unexpected end of JSON input`。补丁让末尾的 CR 等下一个分块到达后再判断。`tests/pi-sse-crlf.mjs` 对库和 CLI bundle 分别验证。
+- pi-retry-patterns.patch：始终启用。扩充可自动重试的错误：网关在流中转发的 Bedrock 异常（`InternalServerException`、`ThrottlingException` 等）、无详情或 JSON 被截断的 SSE 错误事件，以及 Anthropic 的 `violative cyber content` 用量政策拦截（多在流中触发，重新生成可能通过，每次重试仍会重新判定）。配额、计费、权限和 Bedrock 内容过滤仍立即失败。重试次数沿用 Pi 默认的 `retry.maxRetries`（3 次）。`tests/pi-retry.mjs` 对库和 CLI bundle 分别验证。
+- pi-ultra-thinking.patch：仅在 `envy.agents.pi.moreThinking = true` 时启用，增加 `ultra` 思考等级；由 `tests/pi-thinking.mjs` 验证。
 
-This keeps agent capabilities declarative while preserving progressive, task-driven context loading. Changing the physically discoverable set requires a rebuild; ordinary task-level loading does not.
+升级 Pi 时，如果补丁不再适用或上游已经修复，构建或安装检查会失败；这时更新或删除对应补丁。
 
-`envy agent show <name>` and `envy config show --json` report the resolved set in
-`skills`, and the machine's explicit additions in `configuredSkills`. These are
-the evaluated desired state; application-installed skills and project-local
-skills are outside this catalog. Until `envy apply` completes, the currently
-installed links can differ. Unknown or incompatible catalog selections fail
-configuration validation.
+### 模型档位与 btw
 
-List fields use JSON arrays on the CLI, for example:
+`pi/default.nix` 为 OpenAI Completions/Responses 下的 `gpt-6.1-sol` 及其带 `-` 后缀的别名、快照声明合法思考档位：排除 `off`、`minimal`、`ultra`，保留 `low/medium/high`；开启 `moreThinking` 时还保留 `xhigh/max`。显式请求不支持的档位由 Pi 钳制到合法档位，其他模型和 Anthropic 兼容设置保持原样。
 
-```sh
-envy agent set envy.agents.pi.skills '["animate", "break-ui"]' --yes
-envy agent set envy.agents.pi.skills '[]' --yes
-```
+`/btw` 不继承主会话的思考档位。未指定档位的 Sol 请求省略推理 effort，由服务端采用默认值，避免发送会被拒绝的 `none`；不改扩展的认证、上下文、无工具或会话隔离边界。
 
-An empty additions list retains the shared selection. To remove a shared skill,
-change `agents.skills.active` in its owning module. The same JSON-array syntax
-works for `args` and `aliases`; nullable agent fields accept `null` to clear a
-selection.
+`envy agent` 的 Python 运行时生成器使用相同兼容规则，切换 profile 时不会把不支持的档位重新写回 `models.json`。`tests/models.nix` 求值实际 provider 的托管配置；`tests/pi-models.py` 对比 Nix 与运行时配置；`tests/model-lists.nix` 通过实际选项 schema 和共享默认值验证模型列表、profile 覆盖、显式 null、去重及非法输入；`tests/pi-models.mjs` 用真实 `/btw` 执行函数与 Pi 请求编码器执行离线回归，检查模型 schema、档位钳制及两种 OpenAI API 和 Anthropic 的参数。两平台的 `pi-model-tests` flake check 和 CI 运行这些检查；使用假凭据，在请求发送前捕获参数并禁止 fetch，不调用模型。
 
-## Adding a skill subpackage
+### Pi 多模型列表
 
-Create `modules/agents/skills/<skill-name>/SKILL.md`. Use lowercase letters, digits, and hyphens for the directory and frontmatter name. Keep `SKILL.md` concise; place detailed variants in one-level-deep `references/`, repeatable code in `scripts/`, and output templates in `assets/`.
-
-Register it in `skills/catalog.nix`:
+`envy.agents.pi.models` 可以同时注册多个模型，混用 `openai-completions`、`openai-responses` 和 `anthropic-messages`。只有 Pi 实例支持非空列表，其他 adapter 的配置不变。
 
 ```nix
-{
-  envy-maintainer = {
-    source = ./envy-maintainer;
-    targets = [ "codex" "claude-code" ];
-  };
-}
+envy.agents.pi.models = [
+  { profile = "stepfun-openai-new"; }
+  { profile = "stepfun-openai-new"; model = "deepseek-v4.1-flash-qiye"; }
+  { profile = "hb-sub2api"; }
+  {
+    model = "deepseek-v4-pro";
+    endpoint = "deepseek-openai";
+    credential = "deepseek";
+    api = "openai-completions";
+  }
+];
 ```
 
-Then activate it in `modules/agents/default.nix`:
+示例中的 profile 和连接名称需先在所选机器中定义。`envy.agents.pi.contextWindow`、`maxTokens` 是默认模型与所有候选模型的公共参数，覆盖顺序为 Pi 级公共参数 → 当前引用的 profile 非空参数 → 列表条目显式参数；profile 中未填写或为 `null` 的模型参数保留 Pi 级值。endpoint、credential、api 和 model 不在候选之间传播，仍由各自 profile 或条目决定。显式 `null` 清除继承值：`api = null` 恢复按最终 endpoint 协议推导，`credential = null` 使用无认证占位 key，不借用其他连接的凭据，模型参数设为 `null` 则不输出该参数。最终 model 和 endpoint 必须有效。
 
-```nix
-agents.skills.active = [ "envy-maintainer" ];
-```
+保留列表外的 `profile` 或单模型字段时，原选择仍为默认模型并自动加入候选；列表外的 profile 保持原有优先级，不采用列表项的覆盖语义。只配置列表时，第一项为默认模型。空列表回到旧单模型方式；重复的最终配置去重，同一连接、同一模型的冲突参数会报错。
 
-Use a single shared source when both agents accept the same workflow. Split it into provider-specific skills only when frontmatter or behavior genuinely differs.
+多模型模式按 endpoint、最终 API、credential 引用生成稳定的 provider 标识；调整顺序、切换默认 profile 不改变已有连接标识。每个连接从 sops 模板或私有运行时环境读取独立的 key，`models.json` 不保存密钥。首次切换到列表模式会使用新的 provider 标识；单模型模式继续使用 `envy-pi`。
 
-External skill repositories should be pinned as non-flake inputs in `flake.nix`,
-passed to Home Manager through `extraSpecialArgs`, and registered from their
-store paths in `skills/catalog.nix`. Keep provider-native packaging intact: for
-example, Academic Research Skills exposes four coordinated Claude skills, while
-its Codex sibling exposes one `academic-research-suite` router skill. Updating an
-external skill is then an explicit `nix flake update <input-name>` operation.
+`envy agent set envy.agents.pi.models '<JSON array>'` 会校验、保存并即时刷新运行时配置，`envy agent profile use pi <profile>` 只更新默认选择，不丢弃候选列表或改写 Pi 级公共模型参数；编辑 Pi 级 `contextWindow`、`maxTokens` 也保留默认 profile 引用。两者都对新启动的 Pi 生效。直接编辑机器 Nix 文件或使用 `envy config set` 后，通过 `envy apply` 部署。之后日常用 Pi 的 `/model`、`/scoped-models` 或 `Ctrl+P` 切换已注册的模型，不再需要改配置。
 
-The repository currently ships two external presentation skills. `ppt-master`
-is linked from the `ppt-master/SKILL.md` subdirectory of
-`Categorytyy/ppt-master`; it provides the PptxGenJS-oriented presentation
-workflow and its supporting assets. `gpt-image2-ppt-skills` is linked from the
-root `SKILL.md` of `JuneYaooo/gpt-image2-ppt-skills`; it generates image-led
-presentations and can use an OpenAI-compatible image API. Both are pinned as
-`tarball+https://api.github.com/.../tarball/...` inputs because a plain HTTPS
-file input is treated as one file by Nix rather than an unpacked source tree.
-The image skill expects `OPENAI_BASE_URL`, `OPENAI_API_KEY`, and usually
-`GPT_IMAGE_MODEL_NAME=gpt-image-2` at runtime. The Xikai endpoint is wired into
-the agent wrappers, but whether it exposes the image generation API must be
-verified by an actual image request before relying on that feature.
+部署和即时刷新只替换 `models.json` 中的 `envy-pi` / `envy-pi-*` 命名空间，清理退出列表的托管 provider，保留其他 provider 和用户字段。apply 会清除 envY 自己的 Pi 即时覆盖文件，使机器配置重新成为生效来源，不修改 Pi 的 auth、会话或历史。
 
-The shared selection also includes seven frontend skills from
-`emilkowalski/skills` and `vercel-labs/agent-skills`. Their complete directories
-are pinned through the `emil-skills` and `vercel-agent-skills` non-flake inputs
-and linked for Codex, Claude Code, and Pi. See
-[the skill and Pi extension selection guide](agent-skills.md) for the research,
-selected capabilities, commands, and update procedure.
+### Python LSP 诊断与修复预览
 
-## Provider boundary
+`pi/lsp.nix` 固定 `@narumitw/pi-lsp` 0.49.12，并逐个固定 `cross-spawn` 及其传递依赖的 npm SHA-512；通用 npm 解包器不会执行 `npm install`。默认 Python 服务为锁定 nixpkgs 的 `ruff server`，使用绝对 store 路径，覆盖 `.py` 与 `.pyi`。排除 `ruff` 或 `pi` 时，envY 的默认服务列表为空，同时移除这项 Ruff 软件贡献和引用。
 
-Each agent gets an adapter module (`codex.nix`, `claude.nix`, and generic adapters for compatible CLIs). The adapter owns package installation, stable command wrappers, protocol-specific environment names, and skill integration. `modules/llm` owns only non-sensitive endpoint metadata and sops credential declarations. A credential is a logical reference such as `stepfun`; its value is available only through an activation-time sops placeholder and is never a Nix evaluation-time string.
+`lsp_diagnostics` 返回诊断位置、严重程度和代码；`lsp_fix` 的 `source.fixAll` 默认只预览，返回实际 edits 和修改后的文本，写入需要显式 `write: true`。envY 不创建或合并 `pi-lsp.json`，用户和可信项目的自定义配置仍按上游优先级生效。没有加入 Nix/Rust 服务或额外语言功能。
 
-Each adapter receives the shared prompt from `prompts/common.md` and may append provider-specific instructions from `prompts/claude.md`, `prompts/pi.md`, or `prompts/codex.md`. Claude uses `--system-prompt` and preserves the `CCLI_SYSTEM_PROMPT` and `~/.config/ccli/prompt` overrides. Pi uses `--append-system-prompt`, so Pi's built-in system prompt and project context remain available. Codex receives the same rules through `developer_instructions` in its configuration override.
+`pi-lsp-tests` 通过真实 Pi SDK 包装工具启动 Ruff，验证 F401、非空修复预览且源文件不变、正常完成后退出、初始化后取消，以及错误启动参数的负例。测试使用私有 HOME 与配置目录、清空凭据环境并阻断网络，不调用外部模型。两平台都有对应 flake check 与 CI 入口。
 
-Pi enables `+codemode` in its adapter defaults and sets `codemode.mode = "only"`.
-This keeps the normal `read`, `bash`, `edit`, and `write` tools callable from
-scripts while routing active Pi tool calls through codemode. A machine can
-override the complete `defaultTools` list or `codemode.mode` through
-`envy.agents.pi.additionalSettings`. The Pi prompt keeps pure conversational
-replies tool-free and requires codemode for repository-scale, parallel, and
-multi-step work.
+### 上下文视图
 
-Machine-owned agent selections live under `envy.agents`. Provider-specific settings that are outside the fixed schema belong in `additionalSettings`:
+`pi/views.nix` 固定 `pi-context-view` 0.7.0；实际发布包声明的最低 Pi 版本为 1.1.0，没有额外 npm 运行时依赖。`/context usage` 显示上下文分类，`/context injections` 显示系统提示、工具和注入内容。
 
-```nix
-envy.agents.codex = {
-  adapter = "codex";
-  endpoint = "stepfun-openai";
-  credential = "stepfun";
-  model = "step-3.7-flash";
-};
+打开视图不会自动发起模型探测。已有请求快照时使用捕获的数据；还没有快照时显示估算及明确提示，扩展增量尚未捕获，之后的正常请求会更新快照。配置、快照和会话仍归扩展及 Pi 管理，envY 只拥有扩展链接和禁止自动探测的固定补丁。
 
-envy.agents.pi.additionalSettings = {
-  defaultTools = [ "+codemode" ];
-  codemode.mode = "only";
-};
-```
+`pi-context-tests` 使用真实 SDK 和离线 provider 验证请求计数、捕获与渲染；`nix run path:.#checks.aarch64-darwin.pi-context-tests.tui` 使用私有 HOME 在真实 CLI/PTY 验证视图与编辑器切换。TUI 入口在本机执行，两平台 CI 使用对应 system 的入口，不依赖构建沙箱提供终端。
 
-`additionalSettings` is recursively merged during activation into the writable
-user configuration file. Existing application fields are retained, nested
-attribute sets merge by key, declared values win on conflicts, and lists are
-replaced as a whole while preserving their declared order. For example, the
-Pi setting above enables Codemode while retaining Pi's other default tools and
-routing their model-facing calls through the Codemode script runner.
-The same option is available to every adapter that declares a settings file. Adapter modules provide the file format and path; an agent may override that metadata with `additionalSettingsFile`. The provider model files are merged with the same rules, so runtime-added
-providers survive a reapply. Object containment helpers used by module checks
-compare nested attribute sets by key/value and ignore key order; lists remain
-ordered.
+### 差异视图与共存检查
 
-Endpoints live under `envy.llm.endpoints` and contain only a URL and wire
-protocol. Agent adapters translate those fields into the exact variables and
-arguments expected by Codex, Claude Code, or a custom CLI. envY does not source
-one global API-key environment file into every shell; each managed CLI wrapper
-receives only its own rendered template.
+`pi/views.nix` 固定 `@lyrumu/pi-diff` 0.1.0 和唯一运行时依赖 `diff` 8.0.2，将依赖实体复制到扩展旁，不执行 npm 安装。作者 README 的开发基线是 Pi 1.2；本仓库使用真实 Pi 1.1 SDK 与 CLI/PTY 验证，宿主版本不变。`pi-diff-bounded-scans.patch` 限制自动扫描开销。
 
-The Claude wrapper deliberately invokes nixpkgs' `claude` wrapper, not its internal `.claude-wrapped` binary. Nixpkgs uses the outer wrapper to set required runtime environment variables and `PATH`; bypassing it would make this repository responsible for duplicating upstream packaging details.
+`/diff` 查看 Git 差异，`v` 切换布局，Tab 切换范围，Esc 或 q 返回编辑器。检查使用临时 index 基线及实际 before/after 内容，并断言查看前后文件和 index 不变。扩展的历史与缓存仍由应用管理。
 
-`pi` is the upstream `earendil-works/pi` CLI. Its wrapper writes provider
-metadata to `~/.pi/agent/models.json` and selects `envy-pi/gpt-6.1-sol` by
-default. It reads the agent's endpoint, model, API, and credential selections,
-with the `envy-agent-pi` sops template supplying the API key only at launch.
-The model file contains an `$OPENAI_API_KEY` reference, never a decrypted
-secret.
+消息提交只重置 diff 状态，不读取目录基线；第一次可能修改文件的工具调用前才采集基线。家目录和文件系统根目录不自动全树扫描；其他目录的每次自动扫描以 500 毫秒、10,000 个目录条目和 8 MiB 累计内容为预算，单文件最多 2 MiB。shell 前后、收尾扫描和补丁生成都受预算约束；超限后本轮停止全量扫描，保留明确 `edit/write` 目标的首次已知旧侧，持久记录并在轮次/会话视图提示覆盖不完整。未扫描部分不能视为没有变化，也不能推断为文件删除。手动 Git 范围仍按需使用原生 Git 查询。
 
-Pi selects its wire API from the selected endpoint protocol unless
-`envy.agents.<name>.api` supplies an explicit override. The mappings are:
+`pi-diff-tests` 运行 SDK 及真实 Tracker 回归，覆盖空提交、受保护目录、数量/时间/内容预算、显式文件追踪和 Git 暂存/提交后的旧侧。`.tui` 先复用 context 的真实终端驱动打开两个扩展，再在家目录、非 Git 和 Git 目录验证提交事件与新画面；受控挂起扫描证明用户消息出现前没有扫描，不依靠构造庞大目录来测量。`pi-coexist-tests` 使用 Nix 生成的全部非 cron 扩展来源，验证注册无冲突和真实 codemode → LSP → Ruff F401；其 `.tui` 入口在同一 CLI 加载这些扩展，核对视图、快捷键和编辑器恢复。cron 的 daemon 不在此共存测试中启动；Doctor 明确报告该跳过项。
 
-- `openai-compatible` -> `openai-completions` (`/v1/chat/completions`)
-- `anthropic-compatible` -> `anthropic-messages` (`/v1/messages`)
-- an explicit `openai-responses` -> `/v1/responses`
+切换委派模型时使用具体的 `<provider>/<model>` 并核对实际运行报告；本轮改用独立的 Sol 低推理任务，避免模型名称命中默认供应方及重复携带长上下文。
 
-The base URL stays at the API root (for example
-`https://models-proxy.stepfun-inc.com/v1`), not the full request path. The
-gateway must support the selected API. For gateways that reject GPT reasoning
-together with function tools on Chat Completions, choose Responses explicitly.
-For an Anthropic endpoint, envY generates `ANTHROPIC_BASE_URL` and
-`ANTHROPIC_API_KEY`; for OpenAI-compatible endpoints it generates the
-corresponding `OPENAI_*` variables. Custom Anthropic models also receive
-`compat.forceAdaptiveThinking = true`, so Pi sends `thinking.type = adaptive`
-and `output_config.effort`, as required by current Claude models and gateways.
+### Pi 会话委托审批
 
-```nix
-envy.llm.endpoints.my-anthropic = {
-  baseUrl = "https://api.anthropic.com";
-  protocol = "anthropic-compatible";
-};
-envy.agents.pi.endpoint = "my-anthropic";
-```
+`/auto-assigned on <任务范围>` 由用户显式开启本会话的委托审批；省略范围时使用最近一条用户消息。`/auto-assigned off` 随时关闭，`/auto-assigned status` 查看状态；新会话、重新加载和重启后默认关闭，不自动恢复旧授权。先规划的要求保留，授权范围内可由独立模型审核计划；commit、push、apply 和明确保留给用户的决定不由该开关授权。
 
-Use an explicit override when a gateway exposes a protocol that differs from
-its endpoint metadata:
+`pi/auto-assigned.nix` 打包仓库内扩展，并复用锁定 Pi 的 questionnaire UI 作为人工回退，工具只注册一次。独立审核请求复用当前模型与认证，但不提供工具；普通回复通过 `agent_before_settle` 注入标明来源的代审结果并请求继续，questionnaire 通过同一审核处理四种决定：批准时返回已存在的选项；要求修改时将意见作为代审工具结果交给执行助手，保留委托并继续；已完成时关闭委托，只要求最终报告；交给用户时关闭委托并回退原问卷界面。修改和完成均不伪造选项或打开人工问卷；问卷结果的实际渲染也显示审批模型、决定和理由，不被上游选项渲染器隐藏。需要用户信息、审核失败、超时或取消时停止自动继续。相同提案不重复审批；最多 12 次审核，连续 3 次没有成功 edit/write 时停止。审核只携带开启时所在任务之后的用户、助手、工具结果和代审记录；超过 120,000 字符的审核证据不截断放行，直接交给用户。审核依据、模型和用量保存在会话记录中；questionnaire 的审核用量同时计入工具结果，结束事件中的审核用量单独记录。
 
-```sh
-envy config set envy.agents.pi.api openai-responses --json --yes
+`pi-before-settle-abort.patch` 为结束前事件提供独立的取消信号；原宿主低层循环此时已经结束，原来的工具信号无法取消嵌套审核。补丁使 TUI/RPC/SDK 的取消能及时中断审核，并在退出边界时清理。`pi-auto-assigned-tests` 使用真实 SDK、隔离目录和离线模型验证普通计划后继续、问卷四种决定、意见实际进入助手上下文、完成、人工回退、重复、codemode only 嵌套写入计入进展、无进展、无效输出、超时、取消及重新加载；网络请求被拒绝，不使用真实凭据或收费模型。
+
+### Pi footer
+
+`pi/powerline.nix` 固定 pi-powerline 0.11.2 和 registry SHA-512，无额外运行时依赖。打包时将 manifest 入口替换为仓库内的 footer 适配入口，仅导入 `registerFooter`；上游 editor、header、widget 和相应配置命令均不加载，保留 queue 的编辑器。关闭时可在 Pi 设置中将 `powerline` 或 `footer` 设为 false 后重新加载。
+
+适配器补上模型 ID，分支和其余颜色跟随当前 Pi 主题；`system` 是 envY 的默认主题，可跟随终端配色。保留分支、上下文、费用、MCP 和其他扩展状态，读取全局与项目的压缩设置，并把独立委托审核记录中的用量计入累计费用。session start 清理流式状态，退出时释放 footer 订阅和定时器；每处上游源码适配都检查唯一匹配，升级发生漂移即构建失败。
+
+`pi-powerline-tests` 用真实锁定 SDK 和离线模型验证显示、1–200 列宽度、中文、主题切换、会话落盘与恢复、退出清理及 print 模式。`pi-coexist-tests.tui` 使用实际 CLI/PTY，连同 queue、context、diff 等全部部署扩展验证 24/40/120 列、中文输入、dark/light、退出后恢复费用、终端光标恢复，以及非交互输出无 ANSI 污染；模型请求只进入离线替身，不读取真实认证。Linux 检查入口已接入 CI；当前交互证据来自 Darwin。
+
+### Pi 消息队列
+
+`pi/queue.nix` 固定 pi-queue-steer-factory 0.17.8，通过 registry SHA-512 校验解包，链接为 `~/.pi/agent/extensions/envy-queue-steer`。这个版本已有 Pi 1.0 的上游宿主验证，envY 的构建检查使用锁定的 Pi 1.1。普通队列功能不依赖 Pi Fabric。
+
+`pi/extensions.nix` 将 `steeringMode`、`followUpMode` 默认设为 `one-at-a-time`，并通过 writable merge 管理 `keybindings.json` 的三个动作：`Enter` 提交 steer、`Alt+Enter` 添加 follow-up、`Alt+Up` 进入队列编辑。选中行后直接编辑文本，`Alt+Up/Down` 切换行，`Alt+Shift+Up/Down` 重排，`Alt+X` 标记删除，`Alt+Left/Right` 或 `Alt+T` 切换 follow-up/steer，`Enter` 保存、`Escape` 撤销。输入框为空时按 `Enter` 可将队首 follow-up 提升为 steer。macOS 的 Alt 对应 Option。重排、删除和类型切换沿用插件固定按键。
+
+队列、草稿、恢复快照与会话数据归 Pi 和扩展所有。`tests/pi-queue.mjs` 通过真实 Pi 扩展发现流程、宿主模块和编辑器执行离线检查，覆盖逐条发送、编辑、重排、删除、转为 steer、取消与暂停恢复；不调用模型。两平台的 `pi-queue-tests` flake check 和 CI 运行这些检查。配置通过 `envy apply` 部署后，新启动 Pi 或执行 `/reload` 生效。
+
+### goal-x 扩展
+
+`pi/goal.nix` 固定 goal-x 0.33.0（兼容当前 Pi 1.1），在 npm 包解包后应用 `pi-goal-state-and-stages.patch`，不修改已安装的 store 路径或用户目标。`tests/pi-goal.mjs` 在构建时运行，并通过两平台的 `pi-goal-tests` flake check 暴露；测试只使用临时目录、假会话/UI 和真实扩展读写代码，不调用模型。
+
+- `/goal-clear` 在确认前先持久化缓冲修改，再绕过内存池、文件解析缓存和持久快照读取最新目标；确认后的焦点令牌与文件 revision 都必须仍有效。归档文件写入且 active 文件移除成功，才清空焦点。锁、写入、删除和 revision 冲突会报告具体错误，不再显示假成功。删除失败时可能已留下归档副本，但 active 目标与会话焦点仍保留，便于检查和重试。
+- 全局 `~/.pi/agent/pi-goal-x-settings.json` 通过 writable merge 只管理 `hideUnfocusedBanner = true`、`hideUnfocusedPrompt = true`、`autoSelectSingleGoal = false`，保留其他字段。没有焦点的会话不被自动提示阻拦，也不自动接管旧目标。仍可用 `/goal-list`、`/goal-focus`、`/goal-resume` 手动选择。扩展自身的环境变量与项目设置仍按上游优先级覆盖全局默认。
+- 普通 goal 与 Sisyphus 都保留完整阶段、顺序、约束和完成条件；不再要求正文只写一句。`create_goal` 支持与正文一起保存经过校验的父子任务树；未显式提供任务树时，从编号、清单及中英文阶段标记中派生任务，单步骤工作不强制拆分。直接创建时仍尊重关闭任务跟踪的设置。引导草拟还校验用户原始阶段数，拒绝阶段更少的摘要提案。
+- 界面短标题和 `get_goal` 默认摘要不是完整需求；正文用 `get_goal section=objective`、任务用 `section=tasks` 分页读取。补丁不反向重建以前已被模型压缩的目标，也不能仅凭阶段数判断每个阶段的语义是否完整，仍需核对确认提案。
+
+### 子 Agent 角色与工具
+
+`pi/subagents.nix` 链接 Explore、Plan、Researcher、NixReviewer 和 Reviewer。角色默认继承调用者模型，调用时可显式覆盖；Researcher 与 NixReviewer 的默认轮数为 12，Reviewer 为 10。Researcher 只声明文件读取、codemode 和 DeepSeek search/fetch；NixReviewer 只声明文件读取、codemode 和 mcp-nixos；Reviewer 不包含 shell、编辑、写入或 MCP 工具。父会话的工具不能视为子会话已有的能力。
+
+`pi-subagent-tests` 使用真实 Pi 宿主和隔离子会话验证角色发现、模型选择、轮数和可调用工具边界，不调用外部模型。修改角色或升级 pi-subagents 时运行这一检查。
+
+### Agent 运行检查与维护 skills
+
+`envy doctor agents` 比对 `.config/envy/agent-skills.json` 中 Claude/Codex 的托管 skills，以及 `.pi/agent/envy-runtime.json` 中 Pi 的扩展、角色、skills 和 MCP 启动命令。两份契约均来自最终声明，不包含密钥或应用状态；排除 Pi 不跳过公共 skill 链接检查。插件配置声明不作为已安装证据，插件安装状态不在此检查范围。即时配置覆盖只显示是否存在及 apply 的清除行为。扩展探针在临时目录调用真实 Pi 的发现流程，禁止网络和子进程，不读取用户认证或会话；cron 工厂会启动 daemon，因此仅报告跳过，不把它记作加载通过。没有明确静态最低版本声明时报告未知兼容性。
+
+`envy-maintain` 按 Nix、Python、Rust 和 JSON 契约改动选择已有检查；`pi-maintain` 指导锁定版本、运行依赖、父子工具和补丁回归。两个 skills 不自动 apply、创建目标或提交。skill 的 source 来自锁定 flake input 或仓库内目录；catalog 校验每个选中 source 都有 SKILL.md，并检查 target 兼容性。claude-code 与 claude 共用发现目录。
+
+### Skill 行为案例
+
+`pi/tests/skill-cases.json` 固定四项只读案例：envY Python 验证选路、Pi 扩展维护、diff 审查，以及不应加载 skill 的普通问答。每项记录 prompt、应读取与不应读取的 skill，以及禁止动作。`checks/agent-skills.nix` 复用 catalog 校验引用及 Pi 可发现性；离线角色测试继续验证工具边界。这些静态与模拟检查不证明真实模型遵循指令。
+
+需要真实行为评估时，通过现有 subagent 工具分别派发各项 prompt，使用独立上下文、明确的 `<provider>/<model>`、low、`max_turns = 4`；保持题目中的只读限制，不给 agent 期望答案。核对实际工具调用、`SKILL.md` 读取结果及最终答复，记录未命中、禁止调用、实际模型、耗时与 usage。普通问答应无工具调用。不能只凭模型自报已使用 skill 判定通过。
+
+真实模型评估使用供应方额度，不在默认 CI 中调用；案例和离线加载测试分开报告。本轮评估的会话收据放在临时证据目录，不把用户会话或模型输出纳入声明式配置。
+
+`envy-github-actions` 使用锁定 nixpkgs 的 zizmor，隔离 HOME/缓存并以 `--offline --no-config --strict-collection` 审计 workflow；不使用凭据或 `--fix`。两平台有 flake check，CI 构建对应入口。Action 使用现有版本对应的完整 SHA，checkout 关闭凭据持久化。
+
+## 配置边界
+
+machine 文件只提供非敏感 endpoint、model、adapter 和 skill selection。API key 通过 sops credential 引用，不能进入 Nix 字符串或 agent 配置明文。provider wrapper 可以生成稳定命令，但不管理应用-owned 数据。
+
+新增 agent/provider 时：
+
+1. 在对应 module 声明 adapter、package、endpoint 和 credential 引用。
+2. 将敏感值接入 feature 自己的 sops/template 声明。
+3. 需要 skill 时在 catalog 注册上游 input，并限制 targets。
+4. 用 envy check --all 验证 Darwin/Linux。
+
+远程 agent relay 的连接参数属于 provider wrapper；不要把 host key、token 或会话状态写入仓库。
+
+```bash
+nix flake check path:. --no-build
+envy doctor
 envy apply
 ```
-
-`envy config show --json` exposes these API fields and their choices for the
-Settings frontend. `envy agent set` edits the same managed block, and
-`envy agent add ... --api anthropic-messages` sets an explicit API at creation.
-Set the field to `null` to return to protocol-based inference. Invalid API
-selections are rejected before writing. Reapply and restart the agent to
-regenerate its model file; manually editing a generated file is not persistent.
-
-Pi can opt in to additional thinking levels for endpoints that support them:
-
-```nix
-envy.agents.pi.moreThinking = true;
-```
-
-This machine option defaults to `false`. When enabled, envY builds the locked
-Pi source with `modules/agents/patches/pi-ultra-thinking.patch` and declares
-`xhigh`, `max`, and `ultra` in the custom model's `thinkingLevelMap`. Pi exposes
-all three as independent choices in `/thinking` and accepts
-`pi --thinking ultra`; the requested effort is sent unchanged to the endpoint.
-The option makes these levels available without changing the startup level.
-It does not add these capabilities to a model or gateway that lacks them.
-
-`envy config show --json` exposes the boolean for Pi, including its default.
-Use `envy config set envy.agents.pi.moreThinking true --json --yes` (or
-`envy agent set envy.agents.pi.moreThinking true --json --yes`), then
-`envy apply` and restart Pi. Disabling it restores the upstream Pi package
-and omits the extra model mappings. Keep any saved startup thinking level
-within the upstream version's supported levels when disabling the patch.
-
-The patch changes both the runtime libraries and bundled CLI. Its install
-check covers CLI parsing, model metadata, settings, the thinking selector,
-capability clamping, and Chat Completions/Responses request payloads without
-sending a request. Rebuild it when updating the Pi input so upstream schema
-or bundle changes cannot silently remove `ultra` support.
-
-This API-key integration is distinct from an OpenAI Codex subscription, OAuth
-session, or implementation-specific `codex-backend`. envY does not assume
-Codex OAuth credentials can be reused as a generic API key.
-
-Upstream Pi additionally loads the official questionnaire, todo, tools, and
-handoff extensions from the same locked source as its executable.
-`pi-extensions.nix` owns four `envy-*.ts` links under
-`~/.pi/agent/extensions/`; Pi keeps ownership of settings, installed package
-state, and session data. `/handoff <goal>` makes a request to the current model
-to generate a draft for a new session; the user reviews and submits it.
-
-## Retired Oh My Pi configuration
-
-Oh My Pi (OMP) is no longer a supported envY agent. envY no longer installs
-`omp`, generates its provider configuration, or selects skills for
-`~/.omp/agent/skills`.
-
-`envy config check` identifies legacy OMP settings as redundant. Run
-`envy config refine` to remove `envy.agents.omp.*` from the machine's managed
-configuration block, along with any other named agent instance whose adapter
-is `oh-my-pi`, then run `envy apply` to update the installed environment.
-Shared endpoint and credential definitions are preserved because other agents
-may use them. The migration also preserves application-owned auth, history,
-and other state in `~/.omp`; it does not delete that directory.
-
-Legacy configuration rules are kept in `resources/scripts/envy/legacy.py`.
-Runtime modules expose only the current schema; `envy config refine` is the
-single migration boundary. For example, it rewrites the old
-`envy.agents.<name>.more_thinking` assignment to
-`envy.agents.<name>.moreThinking`, and reports a conflict if both spellings
-have different values.
-
-## Shared agent configuration
-
-The adapter modules use Home Manager's internal `config.agents.*` options for
-implementation details. Machine-specific endpoint, model, credential, alias,
-and argument choices belong to `config.envy.agents.*` and are editable through
-the `envy agent` JSON/CLI boundary.
-
-Useful commands include:
-
-```sh
-envy agent ls --json
-envy agent show codex --json
-envy agent add dsh --adapter openai-compatible-cli \
-  --endpoint deepseek-openai --credential deepseek --model deepseek-chat
-envy agent set envy.agents.dsh.model deepseek-reasoner --json --yes
-envy agent set envy.llm.endpoints.deepseek-openai.baseUrl https://api.deepseek.com/v1
-envy agent credential-set deepseek \
-  --secret-path llm/deepseek/apikey --stdin
-```
-
-The JSON boundary is also the integration point for the Ratatui frontend. The
-Settings view exposes evaluated endpoint and agent scalar fields; writes route
-through `envy agent set`, so the TUI does not edit Nix files or decrypted
-secrets directly. A future richer agent screen can use the same `agent add`,
-`agent set`, and `agent credential-set` operations for composition and masked
-secret input.
-
-The two files contribute to different module systems. `default.nix` is imported
-through the cross-platform `home.nix` composition root. `darwin.nix` is imported
-through the repository's `darwin.nix` composition root and contributes only
-Darwin Homebrew distribution policy. `flake.nix` does not import either feature
-implementation directly.
-
-Skill selection is explicit in `modules/agents/default.nix`; for example, the
-research subset is:
-
-```nix
-agents = {
-  skills = {
-    active = [
-      "academic-research-suite"
-      "academic-paper"
-      "academic-paper-reviewer"
-      "academic-pipeline"
-      "deep-research"
-    ];
-  };
-};
-```
-
-The Claude package selection, prompt path, and skill catalog remain Nix-only implementation settings. A machine that cannot install Claude excludes the stable package name with `envy.software.nix.packages.exclude = [ "claude" ];`; no provider-specific enable option is needed. Authentication, history, caches, sessions, and other application-owned state are not managed by this module.
-
-CodeGraph and Headroom are shared agent tools on Darwin and Linux. The feature
-contributes them through `envy.software.npm.tools` and
-`envy.software.pypi.tools`; `modules/software/` owns their cross-platform
-installation lifecycle, while CodeGraph MCP registration remains agent-owned.
-The activation ensures and normalizes CodeGraph's Codex TOML table before and
-after the upstream installer runs. This keeps registration idempotent when
-Codex renders nested MCP table headers with indentation, which CodeGraph 0.9.7
-otherwise misdetects and appends as a duplicate key.
-Linux additionally installs Codex and RTK on both server and desktop machines,
-and Cursor only when `envy.linux.option = "desktop"`. Darwin continues to
-distribute Codex and ChatGPT through Homebrew casks.
-
-## Remote agent relay
-
-`envy remote-agent` (or its short form `envy ra`) launches an agent on another
-machine. The remote agent is required to connect back over SSH and do the actual
-work on the machine where the command was invoked. The command reads a
-user-owned `~/.config/envy/remote-agents.toml`; authentication files, agent history,
-and provider caches remain application-owned.
-
-Create the commented starter file with:
-
-```sh
-envy remote-agent init
-```
-
-A connection using an SSH config `Host` entry looks like this:
-
-```toml
-[defaults]
-target = "remote-agent"
-agent = "claude"
-system_prompt = "After connecting back, use the launcher host's local tools and filesystem for this task."
-
-[connections.remote-agent]
-method = "ssh"
-host = "my-remote-host"       # resolved through ~/.ssh/config
-args = ["-A"]
-remote_identity = "~/.ssh/id_ed25519"
-return_host = "this-machine-reachable-name"
-return_user = "chi"
-return_port = 22
-# Optional wrapper for the remote-to-launcher connection:
-# return_command = ["awesun", "ssh", "{user}@{host}:{port}", "--", "{remote_command}"]
-
-[agents.claude]
-command = ["claude"]
-args = ["--dangerously-skip-permissions"]
-prompt_args = ["--system-prompt", "{system_prompt}"]
-```
-
-`envy remote-agent start` first reads the remote public key (never the private key)
-and appends it to the configured local `authorized_keys` file. `return_host` is
-required because the remote agent must have a concrete SSH path back. The
-command checks that path before starting the configured agent through an
-interactive SSH session. `--dry-run` only inspects the planned connection and
-command; key synchronization and the return-path check are always required for
-a real launch. The local SSH server must accept the user's `authorized_keys`
-file.
-
-For a launcher machine that is reachable through an SSH wrapper such as Awesun,
-set `connections.<name>.return_command`. It is a command vector with the
-placeholders `{host}`, `{user}`, `{port}`, and `{remote_command}`. The same
-command is used for the return-path preflight and exposed to the remote agent
-as `ENVY_REMOTE_RETURN_COMMAND`, so the agent knows how to connect back.
-
-The injected system prompt describes the topology explicitly: the remote runtime
-host where the provider process is running, the launcher host that is the real
-workspace, the envY connection profile, the selected provider and its config,
-and the exact return-command template. It instructs the provider to connect back
-before touching task files and to stop if that connection fails.
-
-For a configured command or a shell alias, use `method = "command"` with a
-complete command vector, or `method = "alias"` with the alias name. Command
-vectors may include `{remote_command}` when the remote command must be placed
-at a particular position. The normal SSH method is preferred when an SSH
-config entry is sufficient.
-
-Provider arguments are deliberately configurable. A Codex installation can
-use its own developer-instruction setting, for example:
-
-```toml
-[agents.codex]
-command = ["codex"]
-prompt_args = ["-c", "developer_instructions={system_prompt}"]
-```
-
-A custom provider can point at a remote configuration under `~/.config`:
-
-```toml
-[agents.my-agent]
-command = ["my-agent"]
-config = "~/.config/my-agent/config.toml"
-config_args = ["--config", "{config}"]
-prompt_args = ["--system-prompt", "{system_prompt}"]
-```
-
-Useful commands are `envy remote-agent list`, `envy remote-agent start <connection>`,
-and `envy remote-agent start <connection> --agent <name> --extra-provider-arg`.

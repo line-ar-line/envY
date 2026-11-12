@@ -7,12 +7,13 @@ from typing import Optional
 
 import typer
 from rich.table import Table
+from rich.text import Text
 
 from envy import log
 from envy.evaluation import informative_nix_error
 from envy.jsonio import emit, emit_error
 from envy.mutation import offer_mutation_commit
-from envy.process import run_process
+from envy.process import CommandError, render_command_error, run_process
 from envy.secure_io import atomic_write_bytes, atomic_write_text
 from envy.utils import (
     DEVICE_LABEL_FILE,
@@ -105,7 +106,7 @@ def complete_matrix_groups(ctx, incomplete: str) -> list[tuple[str, str]]:
     """Complete canonical groups without evaluating every repository machine."""
     del ctx
     try:
-        from envy.software import groups_for_platform
+        from envy.software.model import groups_for_platform
 
         by_key: dict[str, tuple[str, set[str]]] = {}
         for platform in ("darwin", "linux"):
@@ -484,17 +485,17 @@ def cmd_diff(
         return
     settings = differences["settings"]
     software = differences["software"]
-    table = Table(title=f"Machine diff - {left} → {right}")
+    table = Table(title=Text(f"Machine diff - {left} → {right}"))
     table.add_column("Kind")
     table.add_column("Path/Group")
-    table.add_column(left)
-    table.add_column(right)
+    table.add_column(Text(left))
+    table.add_column(Text(right))
     for row in settings:
-        table.add_row("setting", row["path"], str(row["left"]), str(row["right"]))
+        table.add_row("setting", Text(row["path"]), Text(str(row["left"])), Text(str(row["right"])))
     for row in software["leftOnly"]:
-        table.add_row("software", row["group"], row["item"], "-")
+        table.add_row("software", Text(row["group"]), Text(row["item"]), "-")
     for row in software["rightOnly"]:
-        table.add_row("software", row["group"], "-", row["item"])
+        table.add_row("software", Text(row["group"]), "-", Text(row["item"]))
     if not settings and not software["leftOnly"] and not software["rightOnly"]:
         table.add_row("-", "no evaluated differences", "", "")
     log.console.print(table)
@@ -571,8 +572,11 @@ def cmd_check(
     log.step("host", "evaluating machine configuration", machine=selected)
     result = run_process(
         ["nix", "eval", "--impure", attr, "--raw"],
-        cwd=ENVY_ROOT, check=False,
+        cwd=ENVY_ROOT, capture=True, check=False,
     )
     if result.returncode != 0:
+        render_command_error(CommandError(result))
         raise typer.Exit(code=result.returncode)
+    if result.stdout:
+        log.console.print(result.stdout, end="", markup=False, highlight=False)
     log.ok("host", "machine configuration evaluates successfully", machine=selected)

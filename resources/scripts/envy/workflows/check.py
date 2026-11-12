@@ -7,6 +7,7 @@ import re
 import typer
 
 from envy import log
+from envy.evaluation import informative_nix_error
 from envy.process import run_process
 from envy.utils import ENVY_ROOT, current_machine_id, platform_name
 
@@ -56,7 +57,8 @@ def changed_machine_entries() -> list[tuple[str, str]]:
             selected.add((match.group(1), match.group(2)))
         else:
             shared = True
-    return machine_entries() if shared else sorted(selected)
+    available = machine_entries()
+    return available if shared else sorted(selected & set(available))
 
 
 def select_entries(
@@ -100,8 +102,8 @@ def run_machine_checks(
             log.ok("check", "machine passed", machine=label)
         else:
             log.error("check", "machine failed", machine=label, exit_code=result.returncode)
-            if result.stderr:
-                log.hint(result.stderr.strip().splitlines()[-1][:500])
+            if (result.stderr or "").strip():
+                log.hint(informative_nix_error(result.stderr))
     return results
 
 

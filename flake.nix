@@ -21,6 +21,10 @@
       url = "github:Imbad0202/academic-research-skills-codex";
       flake = false;
     };
+    anti-defensive-writing = {
+      url = "github:Kiterlin/anti-defensive-writing";
+      flake = false;
+    };
     ppt-master = {
       url = "tarball+https://api.github.com/repos/Categorytyy/ppt-master/tarball/master";
       flake = false;
@@ -39,6 +43,16 @@
     };
     waza = {
       url = "github:tw93/waza";
+      flake = false;
+    };
+    prompt-master = {
+      url = "github:nidhinjs/prompt-master";
+      flake = false;
+    };
+    # Skill instructions only; the obelisk CLI is pinned separately in
+    # modules/agents/tools/obelisk.nix.
+    obelisk-skill = {
+      url = "github:tommy0103/obelisk-skill";
       flake = false;
     };
     mcp-nixos = {
@@ -61,14 +75,6 @@
       linuxSystem = "x86_64-linux";
       darwinMachineDir = ./hosts/darwin;
       linuxMachineDir = ./hosts/linux;
-      legacyHome = builtins.getEnv "HOME";
-      legacyUserConfigPath = legacyHome + "/.config/dotfiles/config.nix";
-      legacySystemConfigPath = "/etc/dotfiles/config.nix";
-      legacyConfigPath =
-        if legacyHome != "" && builtins.pathExists legacyUserConfigPath then legacyUserConfigPath
-        else if builtins.pathExists legacySystemConfigPath then legacySystemConfigPath
-        else null;
-      legacyConfig = if legacyConfigPath == null then null else import legacyConfigPath;
       machineFiles = directory: lib.filterAttrs
         (name: type: type == "regular" && lib.hasSuffix ".nix" name)
         (builtins.readDir directory);
@@ -98,11 +104,14 @@
         machineSystem = system;
         academicResearchSkills = inputs.academic-research-skills;
         academicResearchSkillsCodex = inputs.academic-research-skills-codex;
+        antiDefensiveWriting = inputs.anti-defensive-writing;
         pptMaster = inputs.ppt-master;
         gptImage2PptSkills = inputs.gpt-image2-ppt-skills;
         emilSkills = inputs.emil-skills;
         vercelAgentSkills = inputs.vercel-agent-skills;
         wazaSource = inputs.waza;
+        promptMaster = inputs.prompt-master;
+        obeliskSkill = inputs.obelisk-skill;
         mcpNixosPackage = inputs.mcp-nixos.packages.${system}.default;
         piSource = inputs.pi.outPath;
         piPackage = inputs.pi.packages.${system}.default;
@@ -179,29 +188,6 @@
           (lib.removeSuffix ".nix" fileName)
           (linuxMachineDir + "/${fileName}");
 
-      legacyLinuxConfiguration =
-        if legacyConfig == null then null
-        else
-          let
-            get = path: fallback: lib.attrByPath path fallback legacyConfig;
-            user = get [ "home" "user" ] "chi";
-            userHome = get [ "home" "dir" ] "/home/${user}";
-          in mkLinuxConfigurationFor "default" ({ ... }: {
-            imports = [ ./hosts/default.nix ];
-            envy.user.name = user;
-            envy.user.home = userHome;
-            envy.repository.path = get [ "dotfiles" "path" ] "${userHome}/.envy";
-            envy.git.name = get [ "git" "name" ] user;
-            envy.git.email = get [ "git" "email" ] "${user}@localhost";
-            envy.llm.steps.url = get [ "llm" "steps" "url" ] "https://models-proxy.stepfun-inc.com";
-            envy.llm.steps.model = get [ "llm" "steps" "model" ] "step-3.7-flash";
-            envy.llm.deepseek.url = get [ "llm" "deepseek" "url" ] "https://api.deepseek.com";
-            envy.llm.deepseek.model = get [ "llm" "deepseek" "model" ] "deepseek-v4-pro";
-            envy.vscode.mode = get [ "vscode" "mode" ] "remote";
-            envy.linux.option = get [ "home" "option" ] "desktop";
-            envy.linux.desktop = get [ "home" "desktop" ] "all";
-          });
-
       mkDevShell = system: nixpkgs.legacyPackages.${system}.mkShell {
         packages = with nixpkgs.legacyPackages.${system}; [
           jq
@@ -224,6 +210,10 @@
         shellHook = ''
           export ENVY_DEV_SHELL=1
           export PYTHONPATH="${./resources/scripts}:$PYTHONPATH"
+          # Build caches stay outside the checkout: path: flake evaluation
+          # hashes every file and bundled sources would capture them.
+          export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-''${XDG_CACHE_HOME:-$HOME/.cache}/envy/envy-tui-target}"
+          export PYTHONPYCACHEPREFIX="''${PYTHONPYCACHEPREFIX:-''${XDG_CACHE_HOME:-$HOME/.cache}/envy/pycache}"
           if [ "''${ENVY_DEBUG:-0}" = "1" ]; then
             echo "[DEBUG] devShell: setup environment ready" >&2
             echo "[DEBUG] Available tools: jq, sops, age, ssh-to-age, python3, typer, rich, prompt_toolkit, cargo, rustc, home-manager" >&2
@@ -281,6 +271,20 @@
       mkEnvyPythonCheck = system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+          homes = if system == darwinSystem then
+            lib.mapAttrs (_: configuration: let
+              config = configuration.config;
+            in config.home-manager.users.${config.envy.user.name}) darwinConfigurations
+          else lib.mapAttrs (_: configuration: configuration.config) homeConfigurations;
+          tmuxHomes = lib.filterAttrs (_: config:
+            builtins.hasAttr ".tmux.conf.local" config.home.file
+          ) homes;
+          terminalFixtures = pkgs.writeText "envy-terminal-theme-fixtures.json" (builtins.toJSON {
+            selectedCases = lib.mapAttrs (_: config: {
+              tmuxSource = config.home.file.".tmux.conf".source;
+              tmuxConfig = config.home.file.".tmux.conf.local".text;
+            }) tmuxHomes;
+          });
           python = pkgs.python3.withPackages (ps: [
             ps.typer
             ps.rich
@@ -289,18 +293,39 @@
             ps.tomli-w
           ]);
         in pkgs.runCommand "envy-python-tests" {
-          nativeBuildInputs = [ python pkgs.git ];
+          nativeBuildInputs = [ python pkgs.git pkgs.tmux pkgs.perl ];
         } ''
           export HOME="$TMPDIR/home"
           mkdir -p "$HOME"
           export PYTHONPYCACHEPREFIX="$TMPDIR/pycache"
           export PYTHONPATH="${./resources/scripts}"
           export ENVY_TEST_ROOT="${./.}"
+          export ENVY_TERMINAL_THEME_FIXTURES=${terminalFixtures}
+          export ENVY_REQUIRE_TMUX_TESTS=1
           cd ${./.}
           python -m compileall -q ${./resources/scripts/envy}
           python -m unittest discover -s ${./resources/scripts/tests} -p 'test_*.py'
           touch "$out"
         '';
+
+      mkEnvyStorageCheck = system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          python = mkEnvyPython system;
+          organize = pkgs.callPackage ./modules/storage/organize.nix { };
+        in pkgs.runCommand "envy-storage-tests" {
+          nativeBuildInputs = [ python organize pkgs.restic pkgs.lsof ];
+        } ''
+          export PYTHONPYCACHEPREFIX="$TMPDIR/pycache"
+          export PYTHONPATH="${./resources/scripts}"
+          export ENVY_ROOT="${./.}"
+          python -m unittest discover -s ${./resources/scripts/tests} -p 'test_storage.py'
+          touch "$out"
+        '';
+
+      mkEnvyTuiCheck = system:
+        let pkgs = nixpkgs.legacyPackages.${system};
+        in pkgs.callPackage ./modules/cores/packages/envy-tui.nix {};
 
       mkEnvyShellCheck = system:
         let pkgs = nixpkgs.legacyPackages.${system};
@@ -315,11 +340,314 @@
           bash -n resources/scripts/mirror-env.sh
           bash -n ${./resources/scripts/flake-source-mirror.sh}
           bash -n resources/scripts/nix-trust.sh
-          shellcheck -x envy install.sh setup.sh requires.sh resources/scripts/mirror-env.sh resources/scripts/flake-source-mirror.sh resources/scripts/nix-trust.sh
+          shellcheck -x envy install.sh setup.sh requires.sh \
+            resources/scripts/mirror-env.sh resources/scripts/flake-source-mirror.sh \
+            resources/scripts/nix-trust.sh resources/scripts/nix-darwin-etc.sh \
+            resources/scripts/spk resources/scripts/ppack resources/scripts/scrctl \
+            resources/helpers/fix-pipewire resources/helpers/nscrctl \
+            resources/helpers/quake resources/helpers/screenshot \
+            modules/agents/amux/image/entry.sh
+          # Sourced fragments carry no shebang; name the shell that reads them.
+          shellcheck -s sh modules/agents/amux/image/profile.sh
+          shellcheck -s bash files/fcitx/deploy.sh
           touch "$out"
         '';
 
+      mkEnvyLintCheck = system:
+        let pkgs = nixpkgs.legacyPackages.${system};
+        in pkgs.runCommand "envy-lint" {
+          nativeBuildInputs = [ pkgs.python3Packages.pyflakes pkgs.deadnix ];
+        } ''
+          cd ${./.}
+          pyflakes setup.py resources/scripts/envy resources/scripts/tests resources/helpers modules/agents
+          deadnix --fail .
+          touch "$out"
+        '';
+
+      mkEnvyPiModelCheck = system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          piPackage = inputs.pi.packages.${system}.default;
+          python = pkgs.python3.withPackages (ps: [
+            ps.typer ps.rich ps.prompt-toolkit ps.pyyaml ps.tomli-w
+          ]);
+          patchedPi = import ./modules/agents/providers/pi/package.nix {
+            inherit lib piPackage;
+            moreThinking = true;
+          };
+          fixtures = pkgs.writeText "pi-model-fixtures.json" (builtins.toJSON
+            (import ./modules/agents/providers/pi/tests/models.nix { inherit lib pkgs piPackage; }));
+          extensions = import ./modules/agents/providers/pi/extensions.nix {
+            inherit lib pkgs piPackage;
+            config.envy.software.nix.packages.exclude = [ ];
+            piSource = inputs.pi.outPath;
+          };
+          btwPackage = extensions.home.file.".pi/agent/extensions/envy-btw".source;
+        in pkgs.runCommand "pi-model-tests" {
+          nativeBuildInputs = [ pkgs.nodejs_24 python (lib.getBin pkgs.nix) ];
+        } ''
+          export HOME="$TMPDIR/home"
+          mkdir -p "$HOME"
+          export PYTHONPYCACHEPREFIX="$TMPDIR/pycache"
+          export PYTHONPATH="${./resources/scripts}"
+          python ${./modules/agents/providers/pi/tests/pi-models.py} ${fixtures}
+          python ${./modules/agents/providers/pi/tests/pi-model-diagnostics.py} \
+            ${./modules/agents/providers/pi/models.nix} ${nixpkgs.outPath}/lib
+          node ${./modules/agents/providers/pi/tests/pi-models.mjs} \
+            ${patchedPi}/lib/pi/node_modules ${fixtures} ${btwPackage}
+          touch "$out"
+        '';
+
+      mkEnvyPiPowerlineCheck = system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          piPackage = inputs.pi.packages.${system}.default;
+          patchedPi = import ./modules/agents/providers/pi/package.nix {
+            inherit lib piPackage;
+            moreThinking = true;
+          };
+          extension = import ./modules/agents/providers/pi/powerline.nix { inherit lib pkgs; };
+        in pkgs.runCommand "pi-powerline-tests" {
+          nativeBuildInputs = [ pkgs.nodejs_24 ];
+        } ''
+          node ${./modules/agents/providers/pi/tests/pi-powerline.mjs} \
+            ${extension} ${patchedPi}/lib/pi/node_modules
+          touch "$out"
+        '';
+
+      mkEnvyPiAutoAssignedCheck = system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          piPackage = inputs.pi.packages.${system}.default;
+          patchedPi = import ./modules/agents/providers/pi/package.nix {
+            inherit lib piPackage;
+            moreThinking = true;
+          };
+          extension = import ./modules/agents/providers/pi/auto-assigned.nix {
+            inherit pkgs;
+            piSource = inputs.pi.outPath;
+          };
+        in pkgs.runCommand "pi-auto-assigned-tests" {
+          nativeBuildInputs = [ pkgs.nodejs_24 ];
+        } ''
+          node ${./modules/agents/providers/pi/tests/pi-auto-assigned.mjs} \
+            ${extension} ${patchedPi}/lib/pi/node_modules
+          touch "$out"
+        '';
+
+      mkEnvyPiQueueCheck = system:
+        import ./modules/agents/providers/pi/queue.nix {
+          inherit lib;
+          pkgs = nixpkgs.legacyPackages.${system};
+          piPackage = inputs.pi.packages.${system}.default;
+        };
+
+      mkGithubActionsCheck = system:
+        import ./checks/github-actions.nix {
+          pkgs = nixpkgs.legacyPackages.${system};
+        };
+
+      mkEnvyPiGoalCheck = system:
+        import ./modules/agents/providers/pi/goal.nix {
+          inherit lib;
+          pkgs = nixpkgs.legacyPackages.${system};
+          piPackage = inputs.pi.packages.${system}.default;
+        };
+
+      mkEnvyPiSubagentCheck = system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          piPackage = inputs.pi.packages.${system}.default;
+          subagents = import ./modules/agents/providers/pi/subagents.nix { inherit lib pkgs; };
+          package = subagents.home.file.".pi/agent/extensions/envy-subagents".source;
+        in pkgs.runCommand "pi-subagent-tests" {
+          nativeBuildInputs = [ pkgs.nodejs_24 ];
+        } ''
+          export HOME="$TMPDIR/home"
+          mkdir -p "$HOME"
+          node ${./modules/agents/providers/pi/tests/pi-subagents.mjs} \
+            ${package} ${piPackage}/lib/pi/node_modules ${./files/agents/subagents}
+          touch "$out"
+        '';
+
+      mkEnvyPiLspCheck = system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          piPackage = inputs.pi.packages.${system}.default;
+          patchedPi = import ./modules/agents/providers/pi/package.nix {
+            inherit lib piPackage;
+            moreThinking = true;
+          };
+          lsp = import ./modules/agents/providers/pi/lsp.nix {
+            inherit lib pkgs piPackage;
+          };
+        in pkgs.runCommand "pi-lsp-tests" {
+          nativeBuildInputs = [ pkgs.nodejs_24 ];
+        } ''
+          node ${./modules/agents/providers/pi/tests/pi-lsp.mjs} \
+            ${lsp} ${patchedPi}/lib/pi/node_modules \
+            ${lib.escapeShellArg (builtins.toJSON lsp.serverCommand)}
+          touch "$out"
+        '';
+
+      mkEnvyPiContextCheck = system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          piPackage = inputs.pi.packages.${system}.default;
+          patchedPi = import ./modules/agents/providers/pi/package.nix {
+            inherit lib piPackage;
+            moreThinking = true;
+          };
+          views = import ./modules/agents/providers/pi/views.nix { inherit lib pkgs; };
+          tui = pkgs.writeShellApplication {
+            name = "pi-context-tui-tests";
+            runtimeInputs = [ pkgs.python3 ];
+            text = ''
+              exec python3 ${./modules/agents/providers/pi/tests/pi-context-tui.py} \
+                ${pkgs.nodejs_24}/bin/node \
+                ${patchedPi}/lib/pi/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js \
+                ${views.context}
+            '';
+          };
+        in pkgs.runCommand "pi-context-tests" {
+          nativeBuildInputs = [ pkgs.nodejs_24 ];
+          passthru = { inherit tui; };
+        } ''
+          node ${./modules/agents/providers/pi/tests/pi-context.mjs} \
+            ${views.context} ${patchedPi}/lib/pi/node_modules
+          touch "$out"
+        '';
+
+      mkEnvyPiDiffCheck = system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          piPackage = inputs.pi.packages.${system}.default;
+          patchedPi = import ./modules/agents/providers/pi/package.nix {
+            inherit lib piPackage;
+            moreThinking = true;
+          };
+          views = import ./modules/agents/providers/pi/views.nix { inherit lib pkgs; };
+          tui = pkgs.writeShellApplication {
+            name = "pi-diff-tui-tests";
+            runtimeInputs = [ pkgs.python3 ];
+            text = ''
+              python3 ${./modules/agents/providers/pi/tests/pi-context-tui.py} \
+                ${pkgs.nodejs_24}/bin/node \
+                ${patchedPi}/lib/pi/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js \
+                ${views.context} ${views.diff} ${pkgs.git}/bin/git
+              exec python3 ${./modules/agents/providers/pi/tests/pi-diff-latency.py} \
+                ${pkgs.nodejs_24}/bin/node \
+                ${patchedPi}/lib/pi/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js \
+                ${views.diff} ${pkgs.git}/bin/git
+            '';
+          };
+        in pkgs.runCommand "pi-diff-tests" {
+          nativeBuildInputs = [ pkgs.nodejs_24 pkgs.git ];
+          passthru = { inherit tui; };
+        } ''
+          node ${./modules/agents/providers/pi/tests/pi-diff.mjs} \
+            ${views.diff} ${patchedPi}/lib/pi/node_modules
+          node ${./modules/agents/providers/pi/tests/pi-diff-scans.mjs} \
+            ${views.diff} ${patchedPi}/lib/pi/node_modules
+          touch "$out"
+        '';
+
+      mkEnvyPiCoexistCheck = system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          piPackage = inputs.pi.packages.${system}.default;
+          patchedPi = import ./modules/agents/providers/pi/package.nix {
+            inherit lib piPackage;
+            moreThinking = true;
+          };
+          extensions = import ./modules/agents/providers/pi/extensions.nix {
+            inherit lib pkgs piPackage;
+            config.envy.software.nix.packages.exclude = [ ];
+            piSource = inputs.pi.outPath;
+          };
+          subagents = import ./modules/agents/providers/pi/subagents.nix { inherit lib pkgs; };
+          files = extensions.home.file // subagents.home.file;
+          sources = lib.mapAttrsToList (_: file: toString file.source)
+            (lib.filterAttrs (target: _: lib.hasPrefix ".pi/agent/extensions/" target) files);
+          sourceJson = lib.escapeShellArg (builtins.toJSON sources);
+          views = import ./modules/agents/providers/pi/views.nix { inherit lib pkgs; };
+          lsp = import ./modules/agents/providers/pi/lsp.nix { inherit lib pkgs; };
+          tui = pkgs.writeShellApplication {
+            name = "pi-coexist-tui-tests";
+            runtimeInputs = [ pkgs.python3 ];
+            text = ''
+              exec python3 ${./modules/agents/providers/pi/tests/pi-context-tui.py} \
+                ${pkgs.nodejs_24}/bin/node \
+                ${patchedPi}/lib/pi/node_modules/@earendil-works/pi-coding-agent/dist/bundle/cli.js \
+                ${views.context} ${views.diff} ${pkgs.git}/bin/git ${sourceJson}
+            '';
+          };
+        in pkgs.runCommand "pi-coexist-tests" {
+          nativeBuildInputs = [ pkgs.nodejs_24 pkgs.git ];
+          passthru = { inherit tui; };
+        } ''
+          node ${./modules/agents/providers/pi/tests/pi-coexist.mjs} \
+            ${patchedPi}/lib/pi/node_modules ${sourceJson} \
+            ${builtins.head lsp.serverCommand} ${./files/agents/subagents}
+          touch "$out"
+        '';
+
+      mkEnvyPiDoctorCheck = system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          piPackage = inputs.pi.packages.${system}.default;
+          patchedPi = import ./modules/agents/providers/pi/package.nix {
+            inherit lib piPackage;
+            moreThinking = true;
+          };
+        in pkgs.runCommand "pi-doctor-tests" {
+          nativeBuildInputs = [ pkgs.nodejs_24 ];
+        } ''
+          node ${./modules/agents/providers/pi/tests/pi-doctor.mjs} \
+            ${./files/agents/pi/doctor.mjs} ${patchedPi}/lib/pi/node_modules
+          touch "$out"
+        '';
+
+      # Agent tools also run these tests while building their packages, but
+      # CI evaluates with --no-build, so expose them as standalone checks.
+      mkEnvyAgentCheck = system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          python = pkgs.python3.withPackages (ps: [ ps.readability-lxml ps.html2text ]);
+        in pkgs.runCommand "envy-agent-tests" {
+          nativeBuildInputs = [ python pkgs.git pkgs.zsh ];
+        } ''
+          export HOME="$TMPDIR/home"
+          mkdir -p "$HOME"
+          export PYTHONPYCACHEPREFIX="$TMPDIR/pycache"
+          AMUX_PATH=${./modules/agents/amux/amux.py} AMUX_COMPLETION=${./modules/agents/amux/_amux} \
+            FETCH_AGENTS_PATH=${./modules/agents/amux/image/fetch-agents.py} python ${./modules/agents/amux/test_amux.py}
+          zsh -n ${./modules/agents/amux/_amux}
+          ENVY_READER_PATH=${./modules/agents/skills/read/scripts/read.py} python ${./modules/agents/tests/test_reader.py}
+          ENVY_DEEPSEEK_SEARCH_PATH=${./modules/agents/tools/deepseek_search.py} python ${./modules/agents/tests/test_deepseek_search.py}
+          ${import ./modules/agents/tests/wrappers.nix { inherit lib pkgs; }}
+          touch "$out"
+        '';
+
+      # Decrypted secrets and rendered templates must stay private to their
+      # owner on every machine; list the ones that grant group or other access.
+      exposedSecretFiles =
+        let
+          sopsConfigs =
+            lib.concatMap
+              (configuration:
+                [ configuration.config.sops ]
+                ++ map (home: home.sops) (builtins.attrValues configuration.config.home-manager.users))
+              (builtins.attrValues darwinConfigurations)
+            ++ map (configuration: configuration.config.sops) (builtins.attrValues homeConfigurations);
+          exposed = sops: kind:
+            lib.mapAttrsToList (name: file: "${kind}.${name} (${file.mode})")
+              (lib.filterAttrs (_: file: builtins.match "0?[0-7]00" file.mode == null) (sops.${kind} or { }));
+        in lib.unique (lib.concatMap (sops: exposed sops "secrets" ++ exposed sops "templates") sopsConfigs);
+
       mkSecretSafetyCheck = system:
+        assert lib.assertMsg (exposedSecretFiles == [ ])
+          "sops files readable beyond their owner: ${lib.concatStringsSep ", " exposedSecretFiles}";
         let
           pkgs = nixpkgs.legacyPackages.${system};
           python = pkgs.python3.withPackages (ps: [ ps.pyyaml ]);
@@ -335,17 +663,9 @@
       darwinConfigurations = lib.mapAttrs' (fileName: value:
         lib.nameValuePair (lib.removeSuffix ".nix" fileName)
           (mkDarwinConfiguration fileName value)) darwinMachines;
-      namedHomeConfigurations = lib.mapAttrs' (fileName: value:
+      homeConfigurations = lib.mapAttrs' (fileName: value:
         lib.nameValuePair (lib.removeSuffix ".nix" fileName)
           (mkLinuxConfiguration fileName value)) linuxMachines;
-      # The historical Linux CLI invoked .#default after pulling. Expose that
-      # target only when its ignored legacy config exists, and derive identity
-      # from that file instead of guessing one of the versioned hosts.
-      # Test only the path here: importing legacy config to decide the output
-      # names would also break named targets when an old config link is stale.
-      homeConfigurations = namedHomeConfigurations // lib.optionalAttrs
-        (legacyConfigPath != null)
-        { default = legacyLinuxConfiguration; };
 
       platformOptionBoundaries =
         lib.all
@@ -354,6 +674,15 @@
             && configuration.options.envy ? environment
             && configuration.options.envy ? shell
             && !(configuration.options.envy ? linux))
+          (builtins.attrValues darwinConfigurations)
+        && lib.all
+          (configuration:
+            let
+              users = configuration.config.home-manager.users;
+              sysInit = users.${configuration.config.envy.user.name}.home.activation.sysInit.data;
+            in
+              # Native package helpers are Linux-only activation functions.
+              lib.hasInfix "esudo()" sysInit && !(lib.hasInfix "esudo_system" sysInit))
           (builtins.attrValues darwinConfigurations)
         && lib.all
           (configuration:
@@ -420,11 +749,22 @@
             && configuration.config.envy.machine.manifest ? shell
             && configuration.config.envy.machine.manifest.software.groups ? "native.system.package"
             && !(configuration.config.envy.machine.manifest.software.groups ? "homebrew.system.cask"))
-          (builtins.attrValues homeConfigurations);
+          (builtins.attrValues homeConfigurations)
+        && lib.all
+          (home:
+            # Agents, Raycast, and Zotero read LLM keys only through logical
+            # credentials; scalar-era names such as llm-steps-apikey are retired.
+            lib.all
+              (name: !(lib.hasPrefix "llm-" name) || lib.hasPrefix "llm-credential-" name)
+              (builtins.attrNames home.sops.secrets))
+          (map
+            (configuration: configuration.config.home-manager.users.${configuration.config.envy.user.name})
+            (builtins.attrValues darwinConfigurations)
+          ++ map (configuration: configuration.config) (builtins.attrValues homeConfigurations));
       mkPlatformOptionCheck = system:
-        assert import ./checks/legacy-linux-compatibility.nix { inherit inputs; };
         assert import ./checks/agent-skills.nix { inherit inputs; };
         assert platformOptionBoundaries;
+        assert import ./checks/terminal-themes.nix { inherit lib darwinConfigurations homeConfigurations; };
         nixpkgs.legacyPackages.${system}.runCommand "envy-platform-option-boundaries" { } ''
           touch $out
         '';
@@ -462,12 +802,44 @@
       devShells.x86_64-linux.default = mkDevShell "x86_64-linux";
       checks.aarch64-darwin.platform-option-boundaries = mkPlatformOptionCheck "aarch64-darwin";
       checks.aarch64-darwin.envy-python-tests = mkEnvyPythonCheck "aarch64-darwin";
+      checks.aarch64-darwin.envy-storage-tests = mkEnvyStorageCheck "aarch64-darwin";
+      checks.aarch64-darwin.envy-tui-tests = mkEnvyTuiCheck "aarch64-darwin";
       checks.aarch64-darwin.envy-shell-checks = mkEnvyShellCheck "aarch64-darwin";
       checks.aarch64-darwin.secret-safety = mkSecretSafetyCheck "aarch64-darwin";
+      checks.aarch64-darwin.envy-lint = mkEnvyLintCheck "aarch64-darwin";
+      checks.aarch64-darwin.envy-github-actions = mkGithubActionsCheck "aarch64-darwin";
+      checks.aarch64-darwin.envy-agent-tests = mkEnvyAgentCheck "aarch64-darwin";
+      checks.aarch64-darwin.pi-powerline-tests = mkEnvyPiPowerlineCheck "aarch64-darwin";
+      checks.aarch64-darwin.pi-auto-assigned-tests = mkEnvyPiAutoAssignedCheck "aarch64-darwin";
+      checks.aarch64-darwin.pi-queue-tests = mkEnvyPiQueueCheck "aarch64-darwin";
+      checks.aarch64-darwin.pi-goal-tests = mkEnvyPiGoalCheck "aarch64-darwin";
+      checks.aarch64-darwin.pi-model-tests = mkEnvyPiModelCheck "aarch64-darwin";
+      checks.aarch64-darwin.pi-subagent-tests = mkEnvyPiSubagentCheck "aarch64-darwin";
+      checks.aarch64-darwin.pi-doctor-tests = mkEnvyPiDoctorCheck "aarch64-darwin";
+      checks.aarch64-darwin.pi-lsp-tests = mkEnvyPiLspCheck "aarch64-darwin";
+      checks.aarch64-darwin.pi-context-tests = mkEnvyPiContextCheck "aarch64-darwin";
+      checks.aarch64-darwin.pi-diff-tests = mkEnvyPiDiffCheck "aarch64-darwin";
+      checks.aarch64-darwin.pi-coexist-tests = mkEnvyPiCoexistCheck "aarch64-darwin";
       checks.x86_64-linux.platform-option-boundaries = mkPlatformOptionCheck "x86_64-linux";
       checks.x86_64-linux.linux-policy-boundaries = linuxPolicyCheck;
       checks.x86_64-linux.envy-python-tests = mkEnvyPythonCheck "x86_64-linux";
+      checks.x86_64-linux.envy-storage-tests = mkEnvyStorageCheck "x86_64-linux";
+      checks.x86_64-linux.envy-tui-tests = mkEnvyTuiCheck "x86_64-linux";
       checks.x86_64-linux.envy-shell-checks = mkEnvyShellCheck "x86_64-linux";
       checks.x86_64-linux.secret-safety = mkSecretSafetyCheck "x86_64-linux";
+      checks.x86_64-linux.envy-lint = mkEnvyLintCheck "x86_64-linux";
+      checks.x86_64-linux.envy-github-actions = mkGithubActionsCheck "x86_64-linux";
+      checks.x86_64-linux.envy-agent-tests = mkEnvyAgentCheck "x86_64-linux";
+      checks.x86_64-linux.pi-powerline-tests = mkEnvyPiPowerlineCheck "x86_64-linux";
+      checks.x86_64-linux.pi-auto-assigned-tests = mkEnvyPiAutoAssignedCheck "x86_64-linux";
+      checks.x86_64-linux.pi-queue-tests = mkEnvyPiQueueCheck "x86_64-linux";
+      checks.x86_64-linux.pi-goal-tests = mkEnvyPiGoalCheck "x86_64-linux";
+      checks.x86_64-linux.pi-model-tests = mkEnvyPiModelCheck "x86_64-linux";
+      checks.x86_64-linux.pi-subagent-tests = mkEnvyPiSubagentCheck "x86_64-linux";
+      checks.x86_64-linux.pi-doctor-tests = mkEnvyPiDoctorCheck "x86_64-linux";
+      checks.x86_64-linux.pi-lsp-tests = mkEnvyPiLspCheck "x86_64-linux";
+      checks.x86_64-linux.pi-context-tests = mkEnvyPiContextCheck "x86_64-linux";
+      checks.x86_64-linux.pi-diff-tests = mkEnvyPiDiffCheck "x86_64-linux";
+      checks.x86_64-linux.pi-coexist-tests = mkEnvyPiCoexistCheck "x86_64-linux";
     };
 }

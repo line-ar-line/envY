@@ -9,7 +9,6 @@ from envy.schemas.validators import (
     is_email,
     is_global_launcher_gesture,
     is_terminal_scratchpad_gesture,
-    is_url,
     non_empty,
 )
 from envy.utils import ENVY_ROOT, HOME_DIR
@@ -33,6 +32,11 @@ class FieldDef:
 
 
 COMMON_MACHINE_FIELDS = [
+    FieldDef(group="STORAGE", dest="machine", path="envy.storage.mode",
+             prompt="Storage lifecycle mode", default_fn=lambda: "manual",
+             choices=["manual", "report", "auto"]),
+    FieldDef(group="STORAGE", dest="machine", path="envy.storage.archive.repository",
+             prompt="Restic SFTP or mounted repository", default_fn=lambda: ""),
     FieldDef(group="BASE", dest="machine", path="envy.user.name", prompt="System username",
              default_fn=lambda: os.getenv("USER", "chi"), validators=[non_empty], required=True),
     FieldDef(group="BASE", dest="machine", path="envy.user.home", prompt="Home directory",
@@ -55,26 +59,15 @@ COMMON_MACHINE_FIELDS = [
     FieldDef(group="MIRRORS", dest="machine", path="envy.mirrors.mode", prompt="Network mirror mode",
              default_fn=lambda: os.getenv("ENVY_MIRROR", "china"),
              choices=["upstream", "china"], required=True),
+    FieldDef(group="AMUX", dest="machine", path="envy.amux.skipPermissions",
+             prompt="Skip agent permission prompts in amux containers", default_fn=lambda: "true",
+             choices=["true", "false"], required=True, nix_type="bool"),
 ]
-
-# These fields were machine-managed before endpoints and agents became
-# dynamic. They remain readable only as a migration source; they must not be
-# rendered, edited, or written back by the normal config commands.
-LEGACY_LLM_MACHINE_FIELDS = [
-    FieldDef(group="LLM", dest="machine", path="envy.llm.steps.url", prompt="StepFun API base URL",
-             default_fn=lambda: os.getenv("STEPFUN_BASE_URL", ""),
-             validators=[non_empty, is_url], required=True),
-    FieldDef(group="LLM", dest="machine", path="envy.llm.steps.model", prompt="StepFun default model",
-             default_fn=lambda: "step-3.7-flash", validators=[non_empty], required=True),
-    FieldDef(group="LLM", dest="machine", path="envy.llm.deepseek.url", prompt="DeepSeek API base URL",
-             default_fn=lambda: "https://api.deepseek.com", validators=[non_empty, is_url], required=True),
-    FieldDef(group="LLM", dest="machine", path="envy.llm.deepseek.model", prompt="DeepSeek default model",
-             default_fn=lambda: "deepseek-v4-pro", validators=[non_empty], required=True),
-]
-
-LEGACY_MACHINE_KEYS = [field.path for field in LEGACY_LLM_MACHINE_FIELDS]
 
 COMMON_SECRET_FIELDS = [
+    FieldDef(group="SECRET", dest="secret", yaml_path="storage/archive/password",
+             path="storage_archive_password", prompt="Restic repository password",
+             default_fn=lambda: ""),
     FieldDef(group="SECRET", dest="secret", yaml_path="home/passwd", path="home_passwd",
              prompt="System password", default_fn=lambda: os.getenv("USER", ""),
              validators=[non_empty], required=True),
@@ -85,19 +78,6 @@ COMMON_SECRET_FIELDS = [
     FieldDef(group="SECRET", dest="secret", yaml_path="llm/deepseek/apikey", path="llm_deepseek_apikey",
              prompt="DeepSeek API Key", default_fn=lambda: ""),
 ]
-
-LEGACY_CONFIG_PATHS = {
-    "envy.user.name": "home.user",
-    "envy.user.home": "home.dir",
-    "envy.repository.path": "dotfiles.path",
-    "envy.git.name": "git.name",
-    "envy.git.email": "git.email",
-    "envy.vscode.mode": "vscode.mode",
-    "envy.llm.steps.url": "llm.steps.url",
-    "envy.llm.steps.model": "llm.steps.model",
-    "envy.llm.deepseek.url": "llm.deepseek.url",
-    "envy.llm.deepseek.model": "llm.deepseek.model",
-}
 
 OBSOLETE_MACHINE_KEYS = ["envy.llm.dashscope.url", "envy.llm.dashscope.model"]
 OBSOLETE_SECRET_PATHS = ["llm/dashscope/apikey"]

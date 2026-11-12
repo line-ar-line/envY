@@ -7,7 +7,8 @@ import click
 from typer.main import get_command
 from typer.testing import CliRunner
 
-from envy import agent, agent_completion, config
+from envy import agent, agent_completion
+from envy.config import secret_store
 from envy.main import cli
 
 
@@ -20,16 +21,19 @@ class AgentCompletionTests(unittest.TestCase):
             "envy.agents.local-pi.endpoint": "custom",
             "envy.llm.endpoints.custom.baseUrl": "https://private.example/v1",
             "envy.llm.credentials.custom.secretPath": "llm/custom/apikey",
+            "envy.agentProfiles.fast.endpoint": "custom",
+            "envy.agentProfiles.fast.credential": "custom",
+            "envy.agentProfiles.fast.model": "fast-model",
         }) + "\n}\n")
         self.before = self.path.read_bytes()
         self.enterContext(patch.object(agent, "machine_config_file", return_value=self.path))
         self.manifest = self.enterContext(patch.object(agent_completion, "machine_manifest", return_value={
-            "agents": {"inherited": {"adapter": "codex"}, "other-pi": {"adapter": "pi"}, "omp": {"adapter": "oh-my-pi"}, "retired": {"adapter": "oh-my-pi"}},
+            "agents": {"inherited": {"adapter": "codex"}, "other-pi": {"adapter": "pi"}},
             "llm": {"endpoints": {"shared": {"baseUrl": "https://example.test/v1"}},
                     "credentials": {"shared": {"secretPath": "llm/shared/token"}}},
         }))
         self.enterContext(patch.object(agent, "read_secrets_data", side_effect=AssertionError("no decryption in completion")))
-        self.enterContext(patch.object(config, "read_secrets_data", side_effect=AssertionError("no decryption in completion")))
+        self.enterContext(patch.object(secret_store, "read_secrets_data", side_effect=AssertionError("no decryption in completion")))
         self.enterContext(patch.object(agent, "_write_values", side_effect=AssertionError("no writes in completion")))
 
     def tearDown(self):
@@ -46,11 +50,11 @@ class AgentCompletionTests(unittest.TestCase):
         for group in ("agent", "config"):
             paths = self.complete(group, "set", "path", "envy.agents.")
             self.assertIn("envy.agents.local-pi.moreThinking", paths)
+            self.assertIn("envy.agents.local-pi.profile", paths)
+            profile_paths = self.complete(group, "set", "path", "envy.agentProfiles.fast.")
+            self.assertIn("envy.agentProfiles.fast.model", profile_paths)
             self.assertIn("envy.agents.inherited.model", paths)
             self.assertIn("envy.agents.other-pi.api", paths)
-            self.assertNotIn("envy.agents.omp.api", paths)
-            self.assertNotIn("envy.agents.retired.api", paths)
-            self.assertNotIn("envy.agents.omp.moreThinking", paths)
             self.assertNotIn("envy.agents.local-pi.args", paths)
             self.assertIn("envy.llm.endpoints.custom.protocol", self.complete(group, "set", "path", "envy.llm.endpoints.c"))
             self.assertIn("envy.llm.credentials.shared.kind", self.complete(group, "set", "path", "envy.llm.credentials.s"))
@@ -61,10 +65,11 @@ class AgentCompletionTests(unittest.TestCase):
             ("envy.agents.local-pi.moreThinking", "t", ["true"]),
             ("envy.agents.other-pi.api", "openai-r", ["openai-responses"]),
             ("envy.agents.other-pi.api", "anthropic", ["anthropic-messages"]),
-            ("envy.agents.omp.api", "", []),
-            ("envy.agents.retired.api", "", []),
             ("envy.agents.inherited.endpoint", "c", ["custom"]),
             ("envy.agents.inherited.credential", "s", ["shared"]),
+            ("envy.agents.local-pi.profile", "f", ["fast"]),
+            ("envy.agentProfiles.fast.endpoint", "c", ["custom"]),
+            ("envy.agentProfiles.fast.credential", "c", ["custom"]),
             ("envy.agents.inherited.adapter", "cl", ["claude-code"]),
             ("envy.llm.endpoints.custom.protocol", "an", ["anthropic-compatible"]),
             ("envy.llm.credentials.custom.kind", "t", ["token"]),
@@ -79,7 +84,9 @@ class AgentCompletionTests(unittest.TestCase):
                     self.assertEqual(self.complete(group, "set", "value", prefix, path=path), expected)
 
     def test_show_includes_inherited_but_remove_only_suggests_managed_agents(self):
-        self.assertEqual(self.complete("agent", "show", "name", ""), ["inherited", "local-pi", "other-pi"])
+        for group in ("agent", "agents", "ag"):
+            for command in ("show", "sh"):
+                self.assertEqual(self.complete(group, command, "name", ""), ["inherited", "local-pi", "other-pi"])
         for command in ("remove", "rm"):
             self.assertEqual(self.complete("agent", command, "name", ""), ["local-pi"])
 
@@ -90,6 +97,18 @@ class AgentCompletionTests(unittest.TestCase):
         ):
             self.assertEqual(self.complete("agent", "add", parameter, prefix), expected)
         self.assertEqual(self.complete("agent", "credential-set", "name", "c"), ["custom"])
+        profile_command = get_command(cli).commands["agent"].commands["profile"].commands["add"]
+        endpoint = next(item for item in profile_command.params if item.name == "endpoint")
+        credential = next(item for item in profile_command.params if item.name == "credential")
+        context = click.Context(profile_command)
+        context.params = {}
+        self.assertEqual([item.value for item in endpoint.shell_complete(context, "c")], ["custom"])
+        self.assertEqual([item.value for item in credential.shell_complete(context, "c")], ["custom"])
+        use_command = get_command(cli).commands["agent"].commands["profile"].commands["use"]
+        agent_name = next(item for item in use_command.params if item.name == "agent_name")
+        profile_name = next(item for item in use_command.params if item.name == "profile_name")
+        self.assertEqual([item.value for item in agent_name.shell_complete(context, "l")], ["local-pi"])
+        self.assertEqual([item.value for item in profile_name.shell_complete(context, "f")], ["fast"])
         self.assertEqual(self.complete("agent", "credential-set", "secret_path", "llm/custom"), ["llm/custom/apikey"])
         self.assertEqual(self.complete("config", "secret-set", "yaml_path", "llm/custom"), ["llm/custom/apikey"])
 
@@ -108,6 +127,35 @@ class AgentCompletionTests(unittest.TestCase):
         self.assertEqual(self.complete("agent", "set", "path", "envy.mirrors."), [])
         with patch.object(agent, "_read_values", side_effect=OSError("missing machine")):
             self.assertEqual(self.complete("agent", "rm", "name", ""), [])
+
+    def test_short_command_names_are_offered_by_completion(self):
+        for args, expected in (("envy ag", "ag"), ("envy ag sh", "sh")):
+            result = CliRunner().invoke(cli, [], prog_name="envy", env={
+                "_ENVY_COMPLETE": "complete_zsh", "_TYPER_COMPLETE_ARGS": args,
+            })
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIn(f'"{expected}":', result.output)
+
+    def test_show_options_and_aliases_complete_through_shell_protocols(self):
+        for shell in ("bash", "zsh"):
+            for group in ("agent", "agents", "ag"):
+                for command_name in ("show", "sh"):
+                    for suffix, expected in (
+                        ("local-pi --d", "--detail"), ("local-pi -d", "-d"), ("l", "local-pi"),
+                    ):
+                        args = f"envy {group} {command_name} {suffix}"
+                        environment = {"_ENVY_COMPLETE": f"complete_{shell}"}
+                        if shell == "bash":
+                            environment.update(COMP_WORDS=args, COMP_CWORD=str(len(args.split()) - 1))
+                        else:
+                            environment["_TYPER_COMPLETE_ARGS"] = args
+                        with self.subTest(shell=shell, group=group, command=command_name, suffix=suffix):
+                            result = CliRunner().invoke(cli, [], prog_name="envy", env=environment)
+                            self.assertEqual(result.exit_code, 0, result.output)
+                            self.assertIn(expected, result.output)
+                            if suffix.endswith("--d"):
+                                self.assertIn("--details", result.output)
+                            self.assertNotIn("private.example", result.output)
 
     def test_real_bash_and_zsh_protocols_complete_without_executing_set(self):
         for shell, args in (("bash", "envy agent set envy.agents.local-pi.moreThinking t"),

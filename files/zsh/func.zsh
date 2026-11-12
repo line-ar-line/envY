@@ -105,8 +105,8 @@ extract() {
 alias ec='extract'
 
 function cat() {
-    if [ -t 1 ]; then
-        bat "$@"
+    if [ -t 1 ] && (( $+commands[bat] )); then
+        command bat "$@"
     else
         command cat "$@"
     fi
@@ -355,7 +355,7 @@ fi
 # ==========================================
 # Zsh Completion & Middleware
 # ==========================================
-autoload -Uz compinit && compinit
+# oh-my-zsh has already run compinit; the compdef calls below rely on it.
 
 # 1. SC Completion
 if command -v systemctl > /dev/null 2>&1; then
