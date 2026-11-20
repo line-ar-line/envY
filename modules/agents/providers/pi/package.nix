@@ -18,7 +18,10 @@ in
   stdenv = args.stdenv // {
     mkDerivation = attrs: args.stdenv.mkDerivation (
       if builtins.isAttrs attrs && (attrs.pname or null) == "pi-workspace-packages"
-      then attrs // { patches = (attrs.patches or [ ]) ++ patches; }
+      then attrs // {
+        patches = (attrs.patches or [ ]) ++ patches;
+        patchFlags = (attrs.patchFlags or [ "-p1" ]) ++ [ "--fuzz=0" ];
+      }
       else attrs);
   };
 })).overrideAttrs (old: {
